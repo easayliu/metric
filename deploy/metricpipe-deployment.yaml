@@ -1,0 +1,130 @@
+# 集群内跑几个 metricpipe 副本，接收全集群应用上报的 OTLP 指标写进 ClickHouse。
+# 和 tracepipe 一样是 push 模型：应用（或 OTel collector）主动发过来，所以是
+# Deployment + Service，不是 DaemonSet；不需要读宿主机文件，也不需要 root。
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monitoring
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: metricpipe-config
+  namespace: monitoring
+data:
+  metricpipe.yaml: |
+    source:
+      type: otlp
+      grpc: 0.0.0.0:4317
+      http: 0.0.0.0:4318
+      max_request_bytes: 16777216
+      enqueue_timeout_secs: 5
+      # 写失败让 SDK 重发，不用磁盘缓冲也至少一次；要更低的导出延迟就关掉
+      wait_for_write: true
+
+    sink:
+      type: clickhouse
+      endpoint: http://clickhouse.logging.svc.cluster.local:8123
+      database: logs
+      table: otel_metric
+      # ClickHouse 集群名。填了就写 Distributed 表、DDL 带 ON CLUSTER；
+      # 改了这里要同步改 metricpipe-ddl-job.yaml 的 CH_CLUSTER
+      # cluster: bj_ck
+      # 和 logpipe / tracepipe 的表配成同一个时区，几张表对照着看时间才是同一口径
+      timezone: Asia/Shanghai
+      user: default
+      password: ""
+      # 常查的标签给类型提示：建表时物化成类型确定的子列，查询不用写 .:Int64。
+      # 只在建表时生效，改了要重跑 ddl Job 之外还得 MODIFY COLUMN 或重建表
+      # attribute_types:
+      #   http.route: String
+      #   http.response.status_code: Int64
+      # 明知不要的 key 直接挡掉，连子列都不建
+      # attribute_skip_regexp: ['^tmp\..*']
+      # 多副本各自小批量写，让服务端再攒一层
+      async_insert: true
+      timeout_secs: 30
+
+    batch:
+      # 一次上报动辄几千个数据点，攒批放大一些
+      max_events: 20000
+      timeout_secs: 2
+
+    pipeline:
+      require_healthy: true
+      on_error: stop
+
+    fields:
+      cluster: bj-prod
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: metricpipe
+  namespace: monitoring
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: metricpipe
+  template:
+    metadata:
+      labels:
+        app: metricpipe
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: metricpipe
+          # 打 v* tag 由 CI 推到 GHCR，见 README「发布」
+          image: ghcr.io/easayliu/metric:v0.1.0
+          args: ["/etc/metricpipe/metricpipe.yaml"]
+          env:
+            - name: RUST_LOG
+              value: info
+          ports:
+            - name: otlp-grpc
+              containerPort: 4317
+            - name: otlp-http
+              containerPort: 4318
+          # 起来之后端口才通；HTTP 端口对非 POST 回 405，能证明进程活着就够了
+          readinessProbe:
+            tcpSocket:
+              port: otlp-grpc
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: otlp-grpc
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          volumeMounts:
+            - name: config
+              mountPath: /etc/metricpipe
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: metricpipe-config
+---
+# 应用把 OTEL_EXPORTER_OTLP_ENDPOINT 指到 http://metricpipe.monitoring.svc.cluster.local:4317
+apiVersion: v1
+kind: Service
+metadata:
+  name: metricpipe
+  namespace: monitoring
+spec:
+  selector:
+    app: metricpipe
+  ports:
+    - name: otlp-grpc
+      port: 4317
+      targetPort: otlp-grpc
+    - name: otlp-http
+      port: 4318
+      targetPort: otlp-http

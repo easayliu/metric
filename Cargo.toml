@@ -1,0 +1,48 @@
+[package]
+name = "metricpipe"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal OTLP metric collector: OTLP receiver -> batch -> ClickHouse"
+license = "MIT"
+readme = "README.md"
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "net", "io-std", "io-util", "signal"] }
+async-trait = "0.1"
+# rc：MetricEvent 里 service_name / metric_name / resource_attributes 是 Arc，
+# 同一个指标下的所有数据点共享而不是各自拷一份
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+chrono = "0.4"
+# sink.timezone：把 IANA 时区名换算成偏移，写 INSERT 时给时间戳带上 +08:00
+chrono-tz = "0.10"
+thiserror = "2"
+serde_yaml_ng = "0.10"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# gzip 这个 feature 只管响应解压；请求体的压缩是 flate2 做的，见 ClickhouseSink
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip"] }
+# 纯 Rust 后端（miniz_oxide），不引入 C 依赖，musl 静态构建照常
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# OTLP 的消息类型和 gRPC 服务定义都是预生成好的，不需要 protoc
+opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic", "metrics", "with-serde"] }
+# gzip：SDK 可能开 OTEL_EXPORTER_OTLP_COMPRESSION=gzip，收不了就只能报 UNIMPLEMENTED
+tonic = { version = "0.14", features = ["gzip"] }
+prost = "0.14"
+# OTLP/HTTP 那一个端口。tonic 自己也依赖 axum，这里不多一份
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+# 属性里的 bytes 值按 OTLP/JSON 的口径转成 base64；opentelemetry-proto 本来就依赖它
+base64 = "0.22"
+
+# 序列化和压缩是单线程热路径，跨 crate 内联和单 CGU 对它有实打实的收益
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[[bin]]
+name = "metricpipe"
+path = "src/main.rs"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+tempfile = "3"

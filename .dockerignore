@@ -1,0 +1,11 @@
+# 构建上下文里只需要 Cargo.toml / Cargo.lock / src。把 target 带进去会让
+# 上下文膨胀到几个 G，还会污染容器里的构建产物。
+target
+.git
+.github
+deploy
+examples
+tests
+README.md
+LICENSE
+metricpipe.yaml

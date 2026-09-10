@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # 供 docker.yml 在打 tag 时复用，作为发布前的闸门
+  workflow_call:
+
+permissions:
+  contents: read
+
+# 同一分支上新的提交会取消掉还在跑的旧任务
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: fmt / clippy / test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # 缓存 ~/.cargo 和 target，第二次起编译只花几十秒
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo fmt --all --check
+
+      # 一并检查 tests/ 和 examples/，不然示例代码烂掉了没人知道
+      - run: cargo clippy --all-targets --locked -- -D warnings
+
+      - run: cargo test --all-targets --locked

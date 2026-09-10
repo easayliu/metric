@@ -1,0 +1,101 @@
+name: Docker
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  # 发布前的闸门：测试没过就不该有镜像。复用 ci.yml，避免两份重复配置。
+  check:
+    uses: ./.github/workflows/ci.yml
+
+  image:
+    name: 构建并推送镜像到 GHCR
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Determine version and tags
+        id: v
+        run: |
+          set -euo pipefail
+          # GHCR 只认小写；仓库名带大写字母时直接被拒。
+          # 用 tr 而不是 ${VAR,,}：后者是 bash 4+ 语法，本地（macOS 自带 bash 3.2）跑不了，
+          # 等于这行只能靠上 CI 才知道对不对。
+          image="ghcr.io/$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
+
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            version="${GITHUB_REF_NAME}"
+
+            # tag 和 Cargo.toml 的版本必须对得上，否则镜像里 metricpipe 报的版本会骗人，
+            # 排查线上问题时按版本号找代码会找错。
+            cargo_version="v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+            if [ "$version" != "$cargo_version" ]; then
+              echo "::error::tag $version 与 Cargo.toml 里的 $cargo_version 不一致，先改 Cargo.toml 再打 tag"
+              exit 1
+            fi
+
+            # v0.2.0-rc1 这类预发布不该动 latest，否则 :latest 会指到未发布的版本
+            case "$version" in
+              *-*) move_latest=false ;;
+              *)   move_latest=true ;;
+            esac
+          else
+            # 手动触发只是验证流水线本身，推一个 sha 镜像，不动 latest
+            version="sha-${GITHUB_SHA::7}"
+            move_latest=false
+          fi
+
+          {
+            echo "version=$version"
+            echo "tags<<EOF"
+            echo "$image:$version"
+            if [ "$move_latest" = true ]; then echo "$image:latest"; fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          # 变量一律用 ${} 定界：紧跟全角括号时，bash 会把多字节字符的头一个字节
+          # 当成变量名的一部分，配上 set -u 直接报 unbound variable。
+          echo "将要推送：${image}:${version}（latest: ${move_latest}）"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          provenance: false
+          tags: ${{ steps.v.outputs.tags }}
+          # 缓存放 registry 而不是 type=gha：GHA 缓存按 ref 隔离，而本工作流只在 v* tag 上
+          # 触发，于是每个 tag 各写各的 scope、永远读不到上一个 tag 的。GitHub 文档：
+          # 「Workflow runs also cannot restore caches created for different tag names.」，
+          # 且 Docker 文档明确 scope 参数绕不过这条限制。registry 后端没有 ref 限制，
+          # tag 之间可互读；目标不存在时只是导入失败、构建照常继续，故首次运行不会挂。
+          #
+          # **mode=max 必须保留**：默认的 min 只导出最终阶段的层，而依赖预编译层在 builder
+          # 这个中间阶段里，min 模式下它根本不会进缓存。
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache
+          cache-to: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache,mode=max
+          # 只出 linux/amd64。要加 arm64 节点的话别直接写 platforms: linux/amd64,linux/arm64
+          # ——那会走 QEMU 模拟，Rust 编译慢到十几分钟以上；改成在 builder 里交叉编译
+          # （装 gcc-aarch64-linux-gnu + rustup target add）才划算。
+          platforms: linux/amd64
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.v.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
