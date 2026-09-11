@@ -449,11 +449,7 @@ impl Stats {
         let total = self.write_nanos_total.swap(0, Ordering::Relaxed);
         let max = self.write_nanos_max.swap(0, Ordering::Relaxed);
         let writes = written_batches + write_failures;
-        let avg_ms = if writes == 0 {
-            0
-        } else {
-            total / writes / 1_000_000
-        };
+        let avg_ms = total.checked_div(writes).unwrap_or(0) / 1_000_000;
         tracing::info!(
             received_batches,
             received_events,
