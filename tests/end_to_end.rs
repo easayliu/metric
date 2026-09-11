@@ -587,6 +587,119 @@ async fn accumulation_overlaps_with_slow_writes() {
     );
 }
 
+/// 队列按数据点数限额：写入卡住时，压满限额之后的请求要在 `enqueue_timeout` 内被拒
+/// （UNAVAILABLE），而不是无限往内存里堆。
+#[tokio::test]
+async fn queue_limit_rejects_when_full() {
+    let (source, grpc_addr, _) = bound_source();
+    let writes = Arc::new(Mutex::new(0usize));
+    let running = Pipeline::builder()
+        .source(source.enqueue_timeout(Duration::from_millis(200)))
+        .sink(SlowSink {
+            writes: Arc::clone(&writes),
+            delay: Duration::from_millis(600),
+        })
+        // 一个请求正好一批；限额也只够一个请求
+        .batch(
+            BatchConfig::default()
+                .max_events(4)
+                .timeout(Duration::from_secs(10)),
+        )
+        .max_queued_events(4)
+        .build()
+        .unwrap()
+        .spawn();
+
+    let mut client = MetricsServiceClient::connect(format!("http://{grpc_addr}"))
+        .await
+        .unwrap();
+    // #1 在写、#2 在写入通道里、#3 卡在交接、#4 占满队列限额
+    for i in 1..=4 {
+        client
+            .export(sample_request())
+            .await
+            .unwrap_or_else(|status| panic!("第 {i} 个请求应当被收下: {status}"));
+    }
+    let start = std::time::Instant::now();
+    let status = client
+        .export(sample_request())
+        .await
+        .expect_err("队列满了应当拒收");
+    assert_eq!(status.code(), tonic::Code::Unavailable, "{status}");
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "要在 enqueue_timeout 附近就回，不能一直等: {:?}",
+        start.elapsed()
+    );
+
+    running.stop().await.unwrap();
+    assert_eq!(*writes.lock().unwrap(), 4, "收下的四批退出前都要写完");
+}
+
+/// 单个请求比整个限额还大：按限额占满放行，不能永远等不到名额。
+#[tokio::test]
+async fn oversized_request_is_still_admitted() {
+    let (source, grpc_addr, _) = bound_source();
+    let sink = MemorySink::new();
+    let running = Pipeline::builder()
+        .source(source)
+        .sink(sink.clone())
+        .batch(batch())
+        .max_queued_events(1)
+        .build()
+        .unwrap()
+        .spawn();
+
+    let mut client = MetricsServiceClient::connect(format!("http://{grpc_addr}"))
+        .await
+        .unwrap();
+    client.export(sample_request()).await.unwrap();
+    wait_for(|| sink.len() == 4, "四个数据点落库").await;
+
+    running.stop().await.unwrap();
+}
+
+/// 开了 wait_for_write 但存储很慢：等到 `write_timeout` 就回 UNAVAILABLE，
+/// 别让所有连接一起挂着。
+#[tokio::test]
+async fn wait_for_write_times_out_instead_of_hanging() {
+    let (source, grpc_addr, _) = bound_source();
+    let writes = Arc::new(Mutex::new(0usize));
+    let running = Pipeline::builder()
+        .source(
+            source
+                .wait_for_write(true)
+                .write_timeout(Duration::from_millis(200)),
+        )
+        .sink(SlowSink {
+            writes: Arc::clone(&writes),
+            delay: Duration::from_millis(800),
+        })
+        .batch(batch())
+        .build()
+        .unwrap()
+        .spawn();
+
+    let mut client = MetricsServiceClient::connect(format!("http://{grpc_addr}"))
+        .await
+        .unwrap();
+    let start = std::time::Instant::now();
+    let status = client
+        .export(sample_request())
+        .await
+        .expect_err("等落库超时应当回可重试的错误");
+    assert_eq!(status.code(), tonic::Code::Unavailable, "{status}");
+    assert!(
+        start.elapsed() < Duration::from_millis(700),
+        "应当在 write_timeout 附近返回: {:?}",
+        start.elapsed()
+    );
+
+    // 超时只是不再等，数据还在队列里，退出前照样写进去
+    running.stop().await.unwrap();
+    assert_eq!(*writes.lock().unwrap(), 1);
+}
+
 /// 端口被占着就整个不启动，报错里要有端口。
 #[tokio::test]
 async fn port_in_use_fails_fast() {

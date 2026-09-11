@@ -1,0 +1,152 @@
+# 现有的 OTel collector（opentelemetry-operator 管理的 jaeger-otel）改成把**指标**
+# 也发给 metricpipe：metrics pipeline 的 exporters 里加一个 otlp exporter 指向
+# metricpipe 的 gRPC 4317。receiver、spanmetrics、prometheus 都不动，也不改
+# ports / replicas（这是出站连接）。
+#
+# ⚠️ 这个 CR 和 tracepipe 仓库里的 deploy/otel-collector.yaml 是**同一个对象**
+# （observability/jaeger-otel）。两边内容必须保持一致 —— 谁后 apply 谁的版本生效，
+# 拿一份只有 tracepipe exporter 的旧文件覆盖上去，指标那条链路就静悄悄断了。这份文件
+# 里两个 exporter 都留着，改完记得把 trace 仓库那份同步过去（或者干脆只留一份，
+# 两个仓库都软链到它）。
+#
+# 上线顺序：先起 metricpipe（ddl Job -> Deployment -> headless Service，见 README），
+# Pod ready 后再 apply 这个。collector 找不到 metricpipe 时会在 sending_queue 里
+# 退避重试，队列满了才丢。
+#
+# 这份文件去掉了 status / managedFields / resourceVersion 这些服务端字段和 Rancher 的
+# objectset 注解；如果这个 CR 是 fleet 下发的，改 fleet 仓库里的那份，别直接 apply。
+---
+apiVersion: opentelemetry.io/v1alpha1
+kind: OpenTelemetryCollector
+metadata:
+  name: jaeger-otel
+  namespace: observability
+spec:
+  mode: deployment
+  replicas: 1
+  upgradeStrategy: automatic
+  image: harbor-intranet.afanticar.com/hub/otel/opentelemetry-collector-contrib:0.81.0
+  ingress:
+    route: {}
+  ports:
+    - name: metrics
+      port: 8889
+      protocol: TCP
+      targetPort: 0
+  resources:
+    limits:
+      cpu: "2"
+      memory: 4Gi
+    requests:
+      cpu: "2"
+      memory: 4Gi
+  targetAllocator:
+    prometheusCR: {}
+    resources: {}
+  config: |
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+          http:
+
+    exporters:
+      prometheus:
+        endpoint: "0.0.0.0:8889"
+      logging:
+      # 指标入库。和下面 otlp/tracepipe 同一套写法，只是端点和队列大小按指标的量调过
+      otlp/metricpipe:
+        # 必须是 headless Service（clusterIP: None）加 dns:/// 前缀：普通 ClusterIP 的
+        # DNS 只有一条 A 记录（那个 VIP），gRPC 建一条长连接，kube-proxy 再按连接钉死
+        # 一个 Pod —— 副本数配几个都只有一个在干活。headless 返回全部 Pod IP，配上
+        # 下面的 round_robin，每个 RPC 才会轮着发给不同副本。
+        # metricpipe 部署在 logging namespace（deploy/metricpipe-deployment.yaml 里
+        # 的 metricpipe-headless）；放到别的 namespace 就改这里
+        endpoint: dns:///metricpipe-headless.logging.svc.cluster.local:4317
+        # 默认是 pick_first：解析出多个地址也只连第一个。必须显式配 round_robin
+        balancer_name: round_robin
+        tls:
+          insecure: true
+        # metricpipe 两个入口都收 gzip
+        compression: gzip
+        # metricpipe 开了 wait_for_write 时，一次导出要等一个攒批周期 + 一次 ClickHouse
+        # 写入，默认 5s 有点紧
+        timeout: 15s
+        # metricpipe 队列满 / 落库失败回 UNAVAILABLE，这里退避重发，
+        # 等于没有磁盘缓冲也至少一次
+        retry_on_failure:
+          enabled: true
+          initial_interval: 1s
+          max_interval: 30s
+          max_elapsed_time: 300s
+        sending_queue:
+          enabled: true
+          # 指标是按上报周期成批来的（SDK 默认 60s 一次），并发压力比 span 小一到两个
+          # 数量级，4 个 consumer 够用
+          num_consumers: 4
+          # 单位是「批数」不是数据点数
+          queue_size: 1000
+      otlp/tracepipe:
+        # 同上，指向 tracepipe 的 headless Service
+        endpoint: dns:///tracepipe-headless.logging.svc.cluster.local:4317
+        balancer_name: round_robin
+        tls:
+          insecure: true
+        compression: gzip
+        timeout: 15s
+        retry_on_failure:
+          enabled: true
+          initial_interval: 1s
+          max_interval: 30s
+          max_elapsed_time: 300s
+        sending_queue:
+          enabled: true
+          # 并发导出数，也就是同时压在几个 tracepipe 副本上。4 个 consumer 在 8k span/s
+          # 下排队，配合 round_robin 抬到 16
+          num_consumers: 16
+          # 单位是「批数」不是 span 数：1000 批 × send_batch_size 10000 已经是千万级
+          # span 挂在内存里，别再往上加 —— 抗抖动靠下面的 memory_limiter，不是靠堆队列
+          queue_size: 1000
+      # 切换期间想双写就把 jaeger 放开，traces pipeline 的 exporters 里两个都列上；
+      # 确认 logs.otel_trace 里数据正常后再删掉
+      jaeger:
+        endpoint: dns:///jaeger-clickhouse-collector.observability.svc:14250
+        tls:
+          insecure: true
+
+    processors:
+      # sending_queue 和 batch 都是纯内存的，collector 一旦 OOM 被杀，排队和在途的
+      # 数据全丢，而且事后不会重发 —— 落库曲线上那种一两分钟的空洞就是这么来的。
+      # memory_limiter 在逼近上限时先给 receiver 回错误（SDK / 上游自己重发），
+      # 保住进程不死。limits 是 4Gi，75% ≈ 3Gi 开始回压。必须是 pipeline 里的第一个。
+      memory_limiter:
+        check_interval: 1s
+        limit_percentage: 75
+        spike_limit_percentage: 15
+      # 每批最多 10000 条，对应 metricpipe / tracepipe 默认 16 MiB 的请求上限足够。
+      # 注意 metrics pipeline 里这个数算的是**数据点**，不是指标条数
+      batch:
+        send_batch_size: 10000
+        timeout: 1s
+
+    connectors:
+      spanmetrics:
+
+    service:
+      pipelines:
+        traces:
+          receivers: [otlp]
+          # memory_limiter 必须排在最前面，排后面就等于没有保护
+          processors: [memory_limiter, batch]
+          exporters: [spanmetrics, otlp/tracepipe]
+        metrics:
+          # otlp = 应用自己上报的指标；spanmetrics = 从 span 算出来的 RED 指标
+          # （调用量 / 错误率 / 耗时直方图），两者一起进 logs.otel_metric，
+          # 按 service_name 就能和 otel_trace、app_log 对上
+          receivers: [spanmetrics, otlp]
+          # 原来这条 pipeline 没挂 processors：memory_limiter 保命、batch 攒批，
+          # 和 traces 一样加上
+          processors: [memory_limiter, batch]
+          # prometheus 那路保留（8889 还在被抓），入库是并行的第二条出口。
+          # 确认 logs.otel_metric 里数据正常、面板切过去之后，再决定要不要撤掉 prometheus
+          exporters: [prometheus, otlp/metricpipe]

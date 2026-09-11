@@ -42,6 +42,9 @@ pub const DEFAULT_HTTP_ADDR: &str = "0.0.0.0:4318";
 /// 指标远到不了，放宽一些给指标特别多（比如整机 host metrics）的来源留余量。
 pub const DEFAULT_MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 pub const DEFAULT_ENQUEUE_TIMEOUT: Duration = Duration::from_secs(5);
+/// `wait_for_write` 时最多等落库多久。要比客户端的导出超时短（SDK 默认 10s），
+/// 否则客户端先超时重发，我们这边的应答就白等了。
+pub const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// 监听在哪：给地址由 source 自己绑，或者把已经绑好的 listener 交进来（测试里用
 /// 端口 0 时要先知道实际端口）。
@@ -70,6 +73,7 @@ pub struct OtlpSource {
     max_request_bytes: usize,
     enqueue_timeout: Duration,
     wait_for_write: bool,
+    write_timeout: Duration,
     fields: Option<Arc<BTreeMap<String, Value>>>,
 }
 
@@ -82,6 +86,7 @@ impl OtlpSource {
             max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
             enqueue_timeout: DEFAULT_ENQUEUE_TIMEOUT,
             wait_for_write: false,
+            write_timeout: DEFAULT_WRITE_TIMEOUT,
             fields: None,
         }
     }
@@ -139,6 +144,18 @@ impl OtlpSource {
         self
     }
 
+    /// `wait_for_write` 时最多等落库多久（默认 [`DEFAULT_WRITE_TIMEOUT`]），超时回
+    /// 「稍后重试」。
+    ///
+    /// 不设上限的话，存储抖动、写入任务在退避重试的那几十秒里，所有连接都挂在这儿；
+    /// 客户端自己超时重发，重发的又排进队列，内存和重复行一起涨。注意超时只是不再等：
+    /// 这批数据仍在队列里、最终还是会写进去，客户端重发的那份就是重复行 —— 这是
+    /// 「至少一次」的代价，表侧要能容忍。
+    pub fn write_timeout(mut self, timeout: Duration) -> Self {
+        self.write_timeout = timeout;
+        self
+    }
+
     /// 附加到每条数据点 上的静态字段。
     pub fn fields(mut self, fields: BTreeMap<String, Value>) -> Self {
         self.fields = (!fields.is_empty()).then(|| Arc::new(fields));
@@ -161,6 +178,7 @@ impl Source for OtlpSource {
             max_request_bytes,
             enqueue_timeout,
             wait_for_write,
+            write_timeout,
             fields,
         } = *self;
         if grpc.is_none() && http.is_none() {
@@ -182,6 +200,7 @@ impl Source for OtlpSource {
             max_request_bytes,
             enqueue_timeout,
             wait_for_write,
+            write_timeout,
             fields,
         });
 
@@ -243,6 +262,7 @@ struct Receiver {
     max_request_bytes: usize,
     enqueue_timeout: Duration,
     wait_for_write: bool,
+    write_timeout: Duration,
     fields: Option<Arc<BTreeMap<String, Value>>>,
 }
 
@@ -255,6 +275,8 @@ enum Reject {
     Closed,
     /// `wait_for_write` 打开、这批数据没能写进存储。
     WriteFailed,
+    /// `wait_for_write` 打开、等了 `write_timeout` 还没写完（数据仍在队列里）。
+    WriteTimeout,
 }
 
 impl Reject {
@@ -263,6 +285,7 @@ impl Reject {
             Reject::Busy => "下游队列已满，稍后重试",
             Reject::Closed => "正在退出，稍后重试",
             Reject::WriteFailed => "写入存储失败，稍后重试",
+            Reject::WriteTimeout => "等待落库超时，稍后重试",
         }
     }
 }
@@ -284,7 +307,11 @@ impl Receiver {
                 .map_err(|_| Reject::Busy)?
                 .map_err(|_| Reject::Closed)?;
             // 发送端被丢弃 = 这批没落库（重试耗尽 / 退出时没写完）
-            ack.await.map_err(|_| Reject::WriteFailed)?;
+            match tokio::time::timeout(self.write_timeout, ack).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => return Err(Reject::WriteFailed),
+                Err(_) => return Err(Reject::WriteTimeout),
+            }
         } else {
             tokio::time::timeout(self.enqueue_timeout, self.out.send(events))
                 .await

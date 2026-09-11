@@ -7,7 +7,13 @@ use std::time::Duration;
 pub struct BatchConfig {
     /// 最多攒多少个数据点。
     pub max_events: usize,
-    /// 最多攒多少字节（按 JSON 估算）。
+    /// 最多攒多少字节（按一行 JSON 估算，见 [`MetricEvent::estimated_size`]）。
+    ///
+    /// 默认放得比 `max_events` 对应的体积宽：一个带十来个标签的数据点估下来一千字节
+    /// 上下，10k 个点约 10 MiB，32 MiB 的上限正常碰不到，攒批由 `max_events` 说了算。
+    /// 这条主要是兜住标签特别多、exemplar 特别多的来源，别把一批攒成几十 MB 的请求体。
+    ///
+    /// [`MetricEvent::estimated_size`]: crate::event::MetricEvent::estimated_size
     pub max_bytes: usize,
     /// 距离第一条数据进入缓冲区超过这个时间就发走。
     pub timeout: Duration,
@@ -17,7 +23,7 @@ impl Default for BatchConfig {
     fn default() -> Self {
         Self {
             max_events: 10_000,
-            max_bytes: 8 * 1024 * 1024,
+            max_bytes: 32 * 1024 * 1024,
             timeout: Duration::from_secs(1),
         }
     }

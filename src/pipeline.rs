@@ -1,8 +1,12 @@
 //! 把 source 和 sink 串起来：攒批、重试、优雅退出。
 
-use tokio::sync::{mpsc, oneshot};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::sync::{mpsc, oneshot, Semaphore};
 use tokio::task::JoinHandle;
-use tokio::time::Instant;
+use tokio::time::{Instant, MissedTickBehavior};
 
 use crate::batch::{BatchConfig, RetryConfig};
 use crate::error::{Error, Result};
@@ -31,9 +35,20 @@ pub struct Pipeline {
     batch: BatchConfig,
     retry: RetryConfig,
     buffer: usize,
+    max_queued_events: usize,
+    stats_interval: Option<Duration>,
     require_healthy: bool,
     on_error: OnError,
 }
+
+/// 默认最多让多少个数据点排在 source 与 pipeline 之间的队列里。
+///
+/// 一个点在内存里连属性带结构体约 1 KB，10 万个点约 100 MB；再加上正在攒的一批和
+/// 正在写的一批（各 `batch.max_events`），就是这个进程的内存上界。
+pub const DEFAULT_MAX_QUEUED_EVENTS: usize = 100_000;
+
+/// 默认每 30 秒打一条运行统计。
+pub const DEFAULT_STATS_INTERVAL: Duration = Duration::from_secs(30);
 
 impl Pipeline {
     pub fn builder() -> PipelineBuilder {
@@ -72,6 +87,8 @@ impl Pipeline {
             batch,
             retry,
             buffer,
+            max_queued_events,
+            stats_interval,
             require_healthy,
             on_error,
         } = self;
@@ -83,15 +100,24 @@ impl Pipeline {
             tracing::warn!(sink = sink.name(), %err, "healthcheck 未通过，仍然继续启动");
         }
 
+        // 队列两道闸：按批数（通道容量）和按数据点总数（信号量）。后者才是内存上界，
+        // 前者只是防止成千上万个小请求把通道撑成长链表。
         let (tx, mut rx) = mpsc::channel(buffer);
+        let limiter = Arc::new(Semaphore::new(max_queued_events));
         let source_name = source.name();
         let sink_name = sink.name();
+        let stats = Arc::new(Stats::default());
 
         // 落库单独起一个任务，攒下一批和写上一批就能重叠起来。通道深度 1 =
         // 双缓冲：一批在写、一批在攒，再多就在 send 处等着，形成对 source 的背压。
         let (write_tx, write_rx) = mpsc::channel::<WriteBatch>(1);
-        let mut writer: JoinHandle<Result<()>> =
-            tokio::spawn(write_batches(sink, write_rx, retry, on_error));
+        let mut writer: JoinHandle<Result<()>> = tokio::spawn(write_batches(
+            sink,
+            write_rx,
+            retry,
+            on_error,
+            Arc::clone(&stats),
+        ));
 
         // 内部信号：外部 Ctrl-C / stop() 会转发到这里，pipeline 自己出错时也用它
         // 叫停 source，否则 source 会在没人接收的情况下空转。
@@ -104,15 +130,29 @@ impl Pipeline {
             }
         });
 
-        let mut source_task: JoinHandle<Result<()>> =
-            tokio::spawn(source.run(SourceSender::new(tx), source_shutdown));
+        let mut source_task: JoinHandle<Result<()>> = tokio::spawn(source.run(
+            SourceSender::new(tx, Arc::clone(&limiter), max_queued_events),
+            source_shutdown,
+        ));
 
         let mut pending = Pending::default();
         let mut deadline: Option<Instant> = None;
         // 写入任务提前结束时它的返回值，避免收尾时二次 await 同一个 JoinHandle。
         let mut writer_outcome: Option<Result<()>> = None;
+        // 第一次 tick 不要立刻来，先攒满一个周期再报
+        let mut stats_tick = stats_interval.map(|every| {
+            let mut tick = tokio::time::interval_at(Instant::now() + every, every);
+            tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            tick
+        });
 
-        tracing::info!(source = source_name, sink = sink_name, "pipeline 启动");
+        tracing::info!(
+            source = source_name,
+            sink = sink_name,
+            max_queued_events,
+            batch_max_events = batch.max_events,
+            "pipeline 启动"
+        );
 
         let result: Result<()> = async {
             loop {
@@ -122,10 +162,22 @@ impl Pipeline {
                         None => std::future::pending().await,
                     }
                 };
+                let stats_due = async {
+                    match stats_tick.as_mut() {
+                        Some(tick) => {
+                            tick.tick().await;
+                        }
+                        None => std::future::pending().await,
+                    }
+                };
 
                 tokio::select! {
                     incoming = rx.recv() => match incoming {
                         Some(mut incoming) => {
+                            stats.received_batches.fetch_add(1, Ordering::Relaxed);
+                            stats
+                                .received_events
+                                .fetch_add(incoming.events.len() as u64, Ordering::Relaxed);
                             for event in incoming.events.drain(..) {
                                 if let Some(event) = apply(&mut transforms, event) {
                                     pending.push(event);
@@ -134,6 +186,9 @@ impl Pipeline {
                             if let Some(ack) = incoming.ack.take() {
                                 pending.acks.push(ack);
                             }
+                            // 这批已经进了 pending，队列名额还回去（pending 自己有
+                            // batch.max_events 兜着）
+                            drop(incoming);
 
                             if deadline.is_none() {
                                 deadline = Some(Instant::now() + batch.timeout);
@@ -152,6 +207,13 @@ impl Pipeline {
                     _ = timer => {
                         hand_off(&write_tx, &mut pending).await?;
                         deadline = None;
+                    }
+                    _ = stats_due => {
+                        stats.report(
+                            max_queued_events - limiter.available_permits(),
+                            rx.len(),
+                            pending.events.len(),
+                        );
                     }
                     // 写入任务只会因为「重试耗尽且 on_error = stop」提前结束。不盯着它的话，
                     // 恰好没有新数据进来时这里会一直等下去，错误要拖到下一批才暴露。
@@ -174,7 +236,9 @@ impl Pipeline {
         };
 
         // 通知 source 收工，并关掉接收端：它下一次发送会立刻失败，不至于卡在背压上。
+        // 信号量也要关：卡在等名额的 send 才会醒过来。
         stop_source.trigger();
+        limiter.close();
         rx.close();
         drop(rx);
         // 释放还没回执的 ack：对应批次没能落库，等回执的客户端会收到失败。
@@ -283,6 +347,7 @@ async fn write_batches(
     mut batches: mpsc::Receiver<WriteBatch>,
     retry: RetryConfig,
     on_error: OnError,
+    stats: Arc<Stats>,
 ) -> Result<()> {
     while let Some(batch) = batches.recv().await {
         // 没有数据但攒了 ack（整批都被 transform 丢掉了），照样回执。这里也要排队，
@@ -294,7 +359,10 @@ async fn write_batches(
 
         let mut attempt = 1;
         let outcome = loop {
-            match sink.write(&batch.events).await {
+            let started = Instant::now();
+            let result = sink.write(&batch.events).await;
+            stats.record_write(started.elapsed(), result.is_ok(), batch.events.len());
+            match result {
                 Ok(()) => break Ok(()),
                 Err(err) if attempt < retry.max_attempts => {
                     let backoff = retry.backoff(attempt);
@@ -338,6 +406,67 @@ async fn write_batches(
 fn ack_all(acks: Vec<oneshot::Sender<()>>) {
     for ack in acks {
         let _ = ack.send(());
+    }
+}
+
+/// 一个统计周期内的计数。主循环和写入任务各记各的，到点由主循环一次读出并清零。
+///
+/// 只有这一处能看到 pipeline 自己跑得怎么样：批攒到多大、写一次多久、队列里压了多少。
+/// 线上说「慢」的时候先看这条日志，比猜强。
+#[derive(Default)]
+struct Stats {
+    received_batches: AtomicU64,
+    received_events: AtomicU64,
+    written_batches: AtomicU64,
+    written_events: AtomicU64,
+    write_failures: AtomicU64,
+    write_nanos_total: AtomicU64,
+    write_nanos_max: AtomicU64,
+}
+
+impl Stats {
+    fn record_write(&self, took: Duration, ok: bool, events: usize) {
+        let nanos = took.as_nanos().min(u64::MAX as u128) as u64;
+        self.write_nanos_total.fetch_add(nanos, Ordering::Relaxed);
+        self.write_nanos_max.fetch_max(nanos, Ordering::Relaxed);
+        if ok {
+            self.written_batches.fetch_add(1, Ordering::Relaxed);
+            self.written_events
+                .fetch_add(events as u64, Ordering::Relaxed);
+        } else {
+            self.write_failures.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// 打一条 info 并清零。`queued_events` / `queued_batches` 是队列里还没进缓冲区的，
+    /// `pending_events` 是正在攒的那一批。
+    fn report(&self, queued_events: usize, queued_batches: usize, pending_events: usize) {
+        let received_batches = self.received_batches.swap(0, Ordering::Relaxed);
+        let received_events = self.received_events.swap(0, Ordering::Relaxed);
+        let written_batches = self.written_batches.swap(0, Ordering::Relaxed);
+        let written_events = self.written_events.swap(0, Ordering::Relaxed);
+        let write_failures = self.write_failures.swap(0, Ordering::Relaxed);
+        let total = self.write_nanos_total.swap(0, Ordering::Relaxed);
+        let max = self.write_nanos_max.swap(0, Ordering::Relaxed);
+        let writes = written_batches + write_failures;
+        let avg_ms = if writes == 0 {
+            0
+        } else {
+            total / writes / 1_000_000
+        };
+        tracing::info!(
+            received_batches,
+            received_events,
+            written_batches,
+            written_events,
+            write_failures,
+            write_avg_ms = avg_ms,
+            write_max_ms = max / 1_000_000,
+            queued_events,
+            queued_batches,
+            pending_events,
+            "pipeline 统计"
+        );
     }
 }
 
@@ -388,6 +517,8 @@ pub struct PipelineBuilder {
     batch: Option<BatchConfig>,
     retry: Option<RetryConfig>,
     buffer: Option<usize>,
+    max_queued_events: Option<usize>,
+    stats_interval: Option<Option<Duration>>,
     require_healthy: bool,
     on_error: Option<OnError>,
 }
@@ -434,6 +565,22 @@ impl PipelineBuilder {
         self
     }
 
+    /// 队列里最多压多少个数据点（默认 [`DEFAULT_MAX_QUEUED_EVENTS`]）。
+    ///
+    /// 这才是内存上界：一次导出请求动辄上万个点，`buffer` 按批数限不住。到了上限
+    /// source 会等（OTLP 那边等满 `enqueue_timeout` 就回「稍后重试」）。
+    pub fn max_queued_events(mut self, events: usize) -> Self {
+        self.max_queued_events = Some(events.max(1));
+        self
+    }
+
+    /// 多久打一条运行统计（收了多少、写了多少、写一次多久、队列压了多少）。
+    /// 默认 [`DEFAULT_STATS_INTERVAL`]；`None` 关掉。
+    pub fn stats_interval(mut self, every: Option<Duration>) -> Self {
+        self.stats_interval = Some(every.filter(|d| !d.is_zero()));
+        self
+    }
+
     /// healthcheck 失败就不启动。
     pub fn require_healthy(mut self, require: bool) -> Self {
         self.require_healthy = require;
@@ -453,6 +600,8 @@ impl PipelineBuilder {
             batch: self.batch.unwrap_or_default(),
             retry: self.retry.unwrap_or_default(),
             buffer: self.buffer.unwrap_or(64),
+            max_queued_events: self.max_queued_events.unwrap_or(DEFAULT_MAX_QUEUED_EVENTS),
+            stats_interval: self.stats_interval.unwrap_or(Some(DEFAULT_STATS_INTERVAL)),
             require_healthy: self.require_healthy,
             on_error: self.on_error.unwrap_or(OnError::Stop),
         })

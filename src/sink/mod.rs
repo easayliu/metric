@@ -4,7 +4,7 @@ pub mod clickhouse;
 pub mod console;
 pub mod memory;
 
-pub use clickhouse::ClickhouseSink;
+pub use clickhouse::{ClickhouseSink, InsertFormat};
 pub use console::ConsoleSink;
 pub use memory::MemorySink;
 

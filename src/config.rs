@@ -12,9 +12,12 @@ use serde_yaml_ng::{Mapping, Value};
 use crate::batch::{BatchConfig, RetryConfig};
 use crate::error::{Error, Result};
 use crate::pipeline::{OnError, Pipeline};
+use crate::pipeline::{DEFAULT_MAX_QUEUED_EVENTS, DEFAULT_STATS_INTERVAL};
 use crate::sink::console::Encoding;
-use crate::sink::{ClickhouseSink, ConsoleSink};
-use crate::source::otlp::{DEFAULT_GRPC_ADDR, DEFAULT_HTTP_ADDR, DEFAULT_MAX_REQUEST_BYTES};
+use crate::sink::{ClickhouseSink, ConsoleSink, InsertFormat};
+use crate::source::otlp::{
+    DEFAULT_GRPC_ADDR, DEFAULT_HTTP_ADDR, DEFAULT_MAX_REQUEST_BYTES, DEFAULT_WRITE_TIMEOUT,
+};
 use crate::source::{OtlpSource, Source, StdinSource};
 
 #[derive(Debug)]
@@ -56,6 +59,10 @@ pub struct OtlpSourceConfig {
     /// 等数据真正写进存储再给客户端回成功。默认关。
     #[serde(default)]
     pub wait_for_write: bool,
+    /// `wait_for_write` 时最多等落库多久，秒；超时回「稍后重试」。要比客户端的导出
+    /// 超时短（SDK 默认 10s）。默认 8。
+    #[serde(default = "default_write_timeout_secs")]
+    pub write_timeout_secs: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -107,13 +114,29 @@ pub struct ClickhouseSinkConfig {
     /// 同上，按正则跳过：`JSON(SKIP REGEXP '^debug\\..*')`。
     #[serde(default)]
     pub attribute_skip_regexp: Vec<String>,
+    /// 让 ClickHouse 服务端再攒一层批。metricpipe 自己已经按 `batch` 攒到上万行，
+    /// 每批体积也多半超过服务端 `async_insert_max_data_size`，一般**不需要**开：
+    /// 开了只是多一次拷贝加 `wait_for_async_insert` 的等待，串行写入下这段等待
+    /// 直接算进 `wait_for_write` 的应答延迟。副本很多、每批很小时才值得。
     #[serde(default)]
     pub async_insert: bool,
     /// gzip 压缩 INSERT 请求体，默认开。只有中间代理不能正确转发压缩 body 时才关。
     #[serde(default = "yes")]
     pub compress: bool,
+    /// INSERT 请求体格式：`json_compact_each_row`（默认，只有值、列名写在 INSERT
+    /// 语句里）或 `json_each_row`（每行带列名，体积大四成，留作退路）。
+    #[serde(default)]
+    pub insert_format: InsertFormatSetting,
     #[serde(default = "thirty")]
     pub timeout_secs: u64,
+}
+
+#[derive(Debug, Default, Deserialize, PartialEq, Eq, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+pub enum InsertFormatSetting {
+    #[default]
+    JsonCompactEachRow,
+    JsonEachRow,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -162,6 +185,13 @@ pub struct PipelineSettings {
     /// source 与 sink 之间的队列深度（按批计）。
     #[serde(default = "default_buffer")]
     pub buffer: usize,
+    /// 队列里最多压多少个数据点。这才是内存上界（一个点约 1 KB），`buffer` 按批数
+    /// 限不住一次上万个点的请求。默认 100000。
+    #[serde(default = "default_max_queued_events")]
+    pub max_queued_events: usize,
+    /// 每隔多少秒打一条运行统计（收发量、写入耗时、队列深度），0 关掉。默认 30。
+    #[serde(default = "default_stats_interval_secs")]
+    pub stats_interval_secs: u64,
     /// healthcheck 不通过就不启动。
     #[serde(default)]
     pub require_healthy: bool,
@@ -217,6 +247,15 @@ fn default_initial_backoff_ms() -> u64 {
 fn default_buffer() -> usize {
     64
 }
+fn default_max_queued_events() -> usize {
+    DEFAULT_MAX_QUEUED_EVENTS
+}
+fn default_stats_interval_secs() -> u64 {
+    DEFAULT_STATS_INTERVAL.as_secs()
+}
+fn default_write_timeout_secs() -> u64 {
+    DEFAULT_WRITE_TIMEOUT.as_secs()
+}
 
 impl Default for BatchSettings {
     fn default() -> Self {
@@ -242,6 +281,8 @@ impl Default for PipelineSettings {
     fn default() -> Self {
         Self {
             buffer: default_buffer(),
+            max_queued_events: default_max_queued_events(),
+            stats_interval_secs: default_stats_interval_secs(),
             require_healthy: false,
             on_error: OnErrorSetting::Stop,
         }
@@ -413,13 +454,18 @@ impl Config {
             attribute_skip_regexp,
             async_insert,
             compress,
+            insert_format,
             timeout_secs,
         } = &**clickhouse;
 
         let mut sink = ClickhouseSink::new(endpoint, database, table)
             .timeout(Duration::from_secs(*timeout_secs))
             .async_insert(*async_insert)
-            .compress(*compress);
+            .compress(*compress)
+            .insert_format(match insert_format {
+                InsertFormatSetting::JsonCompactEachRow => InsertFormat::JsonCompactEachRow,
+                InsertFormatSetting::JsonEachRow => InsertFormat::JsonEachRow,
+            });
         if let Some(cluster) = cluster {
             sink = sink.cluster(cluster);
         }
@@ -474,6 +520,7 @@ impl Config {
                     .max_request_bytes(otlp.max_request_bytes)
                     .enqueue_timeout(Duration::from_secs(otlp.enqueue_timeout_secs))
                     .wait_for_write(otlp.wait_for_write)
+                    .write_timeout(Duration::from_secs(otlp.write_timeout_secs))
                     .fields(fields);
                 if let Some(addr) = grpc {
                     source = source.grpc(addr);
@@ -518,6 +565,11 @@ impl Config {
                 max_backoff: Duration::from_secs(self.retry.max_backoff_secs),
             })
             .buffer(self.pipeline.buffer)
+            .max_queued_events(self.pipeline.max_queued_events)
+            .stats_interval(
+                (self.pipeline.stats_interval_secs > 0)
+                    .then(|| Duration::from_secs(self.pipeline.stats_interval_secs)),
+            )
             .require_healthy(self.pipeline.require_healthy)
             .on_error(match self.pipeline.on_error {
                 OnErrorSetting::Stop => OnError::Stop,
@@ -560,8 +612,11 @@ sink:
         assert_eq!(otlp.grpc.as_deref(), Some("0.0.0.0:4317"));
         assert_eq!(otlp.http.as_deref(), Some("0.0.0.0:4318"));
         assert!(!otlp.wait_for_write);
+        assert_eq!(otlp.write_timeout_secs, 8);
         assert_eq!(config.batch.timeout_secs, 1);
         assert_eq!(config.pipeline.on_error, OnErrorSetting::Stop);
+        assert_eq!(config.pipeline.max_queued_events, 100_000);
+        assert_eq!(config.pipeline.stats_interval_secs, 30);
         config.check().unwrap();
         config.build().unwrap();
     }
@@ -634,6 +689,29 @@ fields:
         );
         assert!(ddl.contains("DateTime64(9, 'Asia/Shanghai')"), "{ddl}");
         config.build().unwrap();
+    }
+
+    #[test]
+    fn insert_format_can_fall_back_to_json_each_row() {
+        let head = "source:\n  type: otlp\nsink:\n  type: clickhouse\n  \
+                    endpoint: http://x:8123\n  database: t\n  table: t\n";
+        let config = Config::parse(head).unwrap();
+        let SinkConfig::Clickhouse(sink) = &config.sink else {
+            panic!()
+        };
+        assert_eq!(sink.insert_format, InsertFormatSetting::JsonCompactEachRow);
+
+        let config = Config::parse(&format!("{head}  insert_format: json_each_row\n")).unwrap();
+        let SinkConfig::Clickhouse(sink) = &config.sink else {
+            panic!()
+        };
+        assert_eq!(sink.insert_format, InsertFormatSetting::JsonEachRow);
+        config.check().unwrap();
+
+        let err = Config::parse(&format!("{head}  insert_format: csv\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`sink` 配置有问题"), "{err}");
     }
 
     #[test]

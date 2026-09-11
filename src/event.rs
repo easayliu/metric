@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Datelike, Offset, Timelike, Utc};
 use chrono_tz::Tz;
-use serde::ser::SerializeMap;
+use serde::ser::{SerializeMap, SerializeSeq};
 use serde::{Serialize, Serializer};
 use serde_json::Value;
 
@@ -205,7 +205,10 @@ impl MetricEvent {
             .or_else(|| self.resource_attributes.get(key))
     }
 
-    /// 估算编码成 JSON 后的字节数，用于按体积攒批。
+    /// 估算编码成一行 `JSONCompactEachRow` 后的字节数，用于按体积攒批。
+    ///
+    /// 只是量级估计：两个时间戳、三十来个数字和空数组的占位大约 100 字节，其余按
+    /// 字符串长度累加。带列名的 `JSONEachRow` 每行还要多五百多字节，这里不算它。
     pub fn estimated_size(&self) -> usize {
         fn attrs(map: &Attributes) -> usize {
             map.iter()
@@ -243,7 +246,7 @@ impl MetricEvent {
             + arrays
             + exemplars
             + extra
-            + 400
+            + 100
     }
 
     /// 编码成一行 JSON（ClickHouse `JSONEachRow`），时间戳按 UTC。
@@ -291,6 +294,46 @@ fn estimated_value_size(value: &Value) -> usize {
     }
 }
 
+/// 固定列的名字，顺序就是 [`MetricEvent`] 写出各列的顺序，也是 ClickHouse sink 建表
+/// 时列的顺序。`JSONCompactEachRow` 没有列名、纯靠位置对齐，两边都以这份为准。
+pub const FIXED_COLUMNS: [&str; 35] = [
+    "timestamp",
+    "start_timestamp",
+    "metric_name",
+    "metric_type",
+    "metric_unit",
+    "metric_description",
+    "service_name",
+    "scope_name",
+    "scope_version",
+    "resource_attributes",
+    "attributes",
+    "value",
+    "temporality",
+    "is_monotonic",
+    "count",
+    "sum",
+    "min",
+    "max",
+    "bucket_counts",
+    "explicit_bounds",
+    "scale",
+    "zero_count",
+    "zero_threshold",
+    "positive_offset",
+    "positive_bucket_counts",
+    "negative_offset",
+    "negative_bucket_counts",
+    "quantiles.quantile",
+    "quantiles.value",
+    "exemplars.timestamp",
+    "exemplars.value",
+    "exemplars.trace_id",
+    "exemplars.span_id",
+    "exemplars.attributes",
+    "flags",
+];
+
 /// 平铺成一层 JSON，时间戳按 UTC 带 `+00:00`。ClickHouse sink 配了时区用 [`WithZone`]。
 impl Serialize for MetricEvent {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -310,6 +353,66 @@ pub struct WithZone<'a> {
 impl Serialize for WithZone<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.event.serialize_in(serializer, self.tz)
+    }
+}
+
+/// 一行 `JSONCompactEachRow`：只有值、没有列名的 JSON 数组，顺序是 [`FIXED_COLUMNS`]
+/// 再接 `extra` 里点名的静态字段列（从 `fields` / `shared` 里取，没有的写 `null`）。
+///
+/// 比 [`WithZone`] 的 JSON 对象少掉每行五百多字节的列名：本地少序列化、少压缩，
+/// ClickHouse 那边也不用逐行按 key 找列。
+pub struct CompactRow<'a> {
+    pub event: &'a MetricEvent,
+    pub tz: Tz,
+    /// 固定列之后还要写哪几列。ClickHouse sink 用的是它 `extra_columns` 的列名。
+    pub extra: &'a [String],
+}
+
+impl Serialize for CompactRow<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let seq = serializer.serialize_seq(Some(FIXED_COLUMNS.len() + self.extra.len()))?;
+        let mut columns = SeqColumns(seq);
+        self.event.fixed_columns(&mut columns, self.tz)?;
+        for name in self.extra {
+            columns.0.serialize_element(&self.event.get(name))?;
+        }
+        columns.0.end()
+    }
+}
+
+/// 一列一列地往外写；JSON 对象（带列名）和 JSON 数组（只有值）两种落法共用一套列表。
+trait Columns {
+    type Error;
+    fn column<T: Serialize + ?Sized>(
+        &mut self,
+        name: &'static str,
+        value: &T,
+    ) -> Result<(), Self::Error>;
+}
+
+struct MapColumns<M>(M);
+
+impl<M: SerializeMap> Columns for MapColumns<M> {
+    type Error = M::Error;
+    fn column<T: Serialize + ?Sized>(
+        &mut self,
+        name: &'static str,
+        value: &T,
+    ) -> Result<(), M::Error> {
+        self.0.serialize_entry(name, value)
+    }
+}
+
+struct SeqColumns<S>(S);
+
+impl<S: SerializeSeq> Columns for SeqColumns<S> {
+    type Error = S::Error;
+    fn column<T: Serialize + ?Sized>(
+        &mut self,
+        _name: &'static str,
+        value: &T,
+    ) -> Result<(), S::Error> {
+        self.0.serialize_element(value)
     }
 }
 
@@ -339,64 +442,10 @@ impl MetricEvent {
     /// 列的顺序和 [`crate::sink::ClickhouseSink`] 的建表语句一致。quantiles / exemplars
     /// 按 ClickHouse `Nested` 的平铺写法给：`exemplars.value` 等各是一个等长数组。
     fn serialize_in<S: Serializer>(&self, serializer: S, tz: Tz) -> Result<S::Ok, S::Error> {
-        let mut map = serializer.serialize_map(None)?;
-        map.serialize_entry("timestamp", &Ts(self.timestamp, tz))?;
-        map.serialize_entry("start_timestamp", &Ts(self.start_timestamp, tz))?;
-        map.serialize_entry("metric_name", &*self.metric_name)?;
-        map.serialize_entry("metric_type", self.metric_type.as_str())?;
-        map.serialize_entry("metric_unit", &*self.metric_unit)?;
-        map.serialize_entry("metric_description", &*self.metric_description)?;
-        map.serialize_entry("service_name", &*self.service_name)?;
-        map.serialize_entry("scope_name", &*self.scope_name)?;
-        map.serialize_entry("scope_version", &*self.scope_version)?;
-        map.serialize_entry("resource_attributes", &*self.resource_attributes)?;
-        map.serialize_entry("attributes", &self.attributes)?;
-        map.serialize_entry("value", &self.value)?;
-        map.serialize_entry("temporality", self.temporality.as_str())?;
-        // UInt8 列：写 0/1 而不是 true/false
-        map.serialize_entry("is_monotonic", &u8::from(self.is_monotonic))?;
-        map.serialize_entry("count", &self.count)?;
-        map.serialize_entry("sum", &self.sum)?;
-        map.serialize_entry("min", &self.min)?;
-        map.serialize_entry("max", &self.max)?;
-        map.serialize_entry("bucket_counts", &self.bucket_counts)?;
-        map.serialize_entry("explicit_bounds", &self.explicit_bounds)?;
-        map.serialize_entry("scale", &self.scale)?;
-        map.serialize_entry("zero_count", &self.zero_count)?;
-        map.serialize_entry("zero_threshold", &self.zero_threshold)?;
-        map.serialize_entry("positive_offset", &self.positive_offset)?;
-        map.serialize_entry("positive_bucket_counts", &self.positive_bucket_counts)?;
-        map.serialize_entry("negative_offset", &self.negative_offset)?;
-        map.serialize_entry("negative_bucket_counts", &self.negative_bucket_counts)?;
-        map.serialize_entry(
-            "quantiles.quantile",
-            &Seq(self.quantiles.iter().map(|q| q.quantile)),
-        )?;
-        map.serialize_entry(
-            "quantiles.value",
-            &Seq(self.quantiles.iter().map(|q| q.value)),
-        )?;
-        map.serialize_entry(
-            "exemplars.timestamp",
-            &Seq(self.exemplars.iter().map(|e| Ts(e.timestamp, tz))),
-        )?;
-        map.serialize_entry(
-            "exemplars.value",
-            &Seq(self.exemplars.iter().map(|e| e.value)),
-        )?;
-        map.serialize_entry(
-            "exemplars.trace_id",
-            &Seq(self.exemplars.iter().map(|e| &e.trace_id)),
-        )?;
-        map.serialize_entry(
-            "exemplars.span_id",
-            &Seq(self.exemplars.iter().map(|e| &e.span_id)),
-        )?;
-        map.serialize_entry(
-            "exemplars.attributes",
-            &Seq(self.exemplars.iter().map(|e| &e.attributes)),
-        )?;
-        map.serialize_entry("flags", &self.flags)?;
+        let map = serializer.serialize_map(None)?;
+        let mut columns = MapColumns(map);
+        self.fixed_columns(&mut columns, tz)?;
+        let mut map = columns.0;
         if let Some(shared) = &self.shared {
             for (key, value) in shared.iter() {
                 if !self.fields.contains_key(key) {
@@ -408,6 +457,67 @@ impl MetricEvent {
             map.serialize_entry(key, value)?;
         }
         map.end()
+    }
+
+    /// 固定的 35 列，顺序和 [`FIXED_COLUMNS`] 逐一对应（有测试盯着）。
+    fn fixed_columns<C: Columns>(&self, out: &mut C, tz: Tz) -> Result<(), C::Error> {
+        out.column("timestamp", &Ts(self.timestamp, tz))?;
+        out.column("start_timestamp", &Ts(self.start_timestamp, tz))?;
+        out.column("metric_name", &*self.metric_name)?;
+        out.column("metric_type", self.metric_type.as_str())?;
+        out.column("metric_unit", &*self.metric_unit)?;
+        out.column("metric_description", &*self.metric_description)?;
+        out.column("service_name", &*self.service_name)?;
+        out.column("scope_name", &*self.scope_name)?;
+        out.column("scope_version", &*self.scope_version)?;
+        out.column("resource_attributes", &*self.resource_attributes)?;
+        out.column("attributes", &self.attributes)?;
+        out.column("value", &self.value)?;
+        out.column("temporality", self.temporality.as_str())?;
+        // UInt8 列：写 0/1 而不是 true/false
+        out.column("is_monotonic", &u8::from(self.is_monotonic))?;
+        out.column("count", &self.count)?;
+        out.column("sum", &self.sum)?;
+        out.column("min", &self.min)?;
+        out.column("max", &self.max)?;
+        out.column("bucket_counts", &self.bucket_counts)?;
+        out.column("explicit_bounds", &self.explicit_bounds)?;
+        out.column("scale", &self.scale)?;
+        out.column("zero_count", &self.zero_count)?;
+        out.column("zero_threshold", &self.zero_threshold)?;
+        out.column("positive_offset", &self.positive_offset)?;
+        out.column("positive_bucket_counts", &self.positive_bucket_counts)?;
+        out.column("negative_offset", &self.negative_offset)?;
+        out.column("negative_bucket_counts", &self.negative_bucket_counts)?;
+        out.column(
+            "quantiles.quantile",
+            &Seq(self.quantiles.iter().map(|q| q.quantile)),
+        )?;
+        out.column(
+            "quantiles.value",
+            &Seq(self.quantiles.iter().map(|q| q.value)),
+        )?;
+        out.column(
+            "exemplars.timestamp",
+            &Seq(self.exemplars.iter().map(|e| Ts(e.timestamp, tz))),
+        )?;
+        out.column(
+            "exemplars.value",
+            &Seq(self.exemplars.iter().map(|e| e.value)),
+        )?;
+        out.column(
+            "exemplars.trace_id",
+            &Seq(self.exemplars.iter().map(|e| &e.trace_id)),
+        )?;
+        out.column(
+            "exemplars.span_id",
+            &Seq(self.exemplars.iter().map(|e| &e.span_id)),
+        )?;
+        out.column(
+            "exemplars.attributes",
+            &Seq(self.exemplars.iter().map(|e| &e.attributes)),
+        )?;
+        out.column("flags", &self.flags)
     }
 }
 
@@ -589,6 +699,59 @@ mod tests {
             "2026-09-07 11:04:08.914294456+08:00"
         );
         assert!(event.estimated_size() > MetricEvent::default().estimated_size());
+    }
+
+    /// `JSONCompactEachRow` 纯靠位置对齐：写出的列顺序必须和 `FIXED_COLUMNS` 一致。
+    #[test]
+    fn fixed_columns_match_the_declared_order() {
+        struct Names(Vec<&'static str>);
+        impl Columns for Names {
+            type Error = std::fmt::Error;
+            fn column<T: Serialize + ?Sized>(
+                &mut self,
+                name: &'static str,
+                _: &T,
+            ) -> Result<(), Self::Error> {
+                self.0.push(name);
+                Ok(())
+            }
+        }
+        let mut names = Names(Vec::new());
+        histogram().fixed_columns(&mut names, Tz::UTC).unwrap();
+        assert_eq!(names.0, FIXED_COLUMNS);
+    }
+
+    /// 紧凑行的每个位置，和带列名的那种写法里同名的值一模一样；extra 列从
+    /// `fields` / `shared` 里取，没有的是 null。
+    #[test]
+    fn compact_row_lines_up_with_the_map_form() {
+        let mut event = histogram();
+        event.shared = Some(Arc::new(
+            [("cluster".to_owned(), Value::from("bj-prod"))]
+                .into_iter()
+                .collect(),
+        ));
+        event.insert("env", "prod");
+        let tz = chrono_tz::Asia::Shanghai;
+
+        let map: Value = serde_json::to_value(WithZone { event: &event, tz }).unwrap();
+        let extra = ["cluster".to_owned(), "env".to_owned(), "absent".to_owned()];
+        let row: Value = serde_json::to_value(CompactRow {
+            event: &event,
+            tz,
+            extra: &extra,
+        })
+        .unwrap();
+        let row = row.as_array().unwrap();
+
+        assert_eq!(row.len(), FIXED_COLUMNS.len() + extra.len());
+        for (i, name) in FIXED_COLUMNS.iter().enumerate() {
+            assert_eq!(&row[i], &map[*name], "第 {i} 列 {name} 对不上");
+        }
+        assert_eq!(row[FIXED_COLUMNS.len()], "bj-prod");
+        assert_eq!(row[FIXED_COLUMNS.len() + 1], "prod");
+        assert_eq!(row[FIXED_COLUMNS.len() + 2], Value::Null);
+        assert_eq!(row[0], "2026-09-07 11:04:08.914293456+08:00");
     }
 
     #[test]

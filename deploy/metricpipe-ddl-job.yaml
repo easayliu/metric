@@ -13,7 +13,7 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   name: metricpipe-ddl
-  namespace: monitoring
+  namespace: logging
 spec:
   backoffLimit: 3
   template:
@@ -22,7 +22,7 @@ spec:
       initContainers:
         - name: render-ddl
           # 和 Deployment 用同一个 tag，否则可能渲染出跟采集端不一致的列
-          image: ghcr.io/easayliu/metric:v0.1.0
+          image: ghcr.io/easayliu/metric:v0.2.0
           command: ["/bin/sh", "-c"]
           args:
             - |

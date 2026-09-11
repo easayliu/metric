@@ -1,4 +1,4 @@
-//! ClickHouse 入库：HTTP 接口 + `JSONEachRow` 批量插入。
+//! ClickHouse 入库：HTTP 接口 + `JSONCompactEachRow` 批量插入（可退回 `JSONEachRow`）。
 //!
 //! 建表语句见 [`ClickhouseSink::create_table_ddl`]，列与 [`MetricEvent`] 一一对应。
 //! 五种指标类型合在一张表里（OTel collector 的 clickhouse exporter 是分五张表的），
@@ -11,8 +11,38 @@ use async_trait::async_trait;
 use chrono_tz::Tz;
 
 use crate::error::{Error, Result};
-use crate::event::{MetricEvent, WithZone};
+use crate::event::{CompactRow, MetricEvent, WithZone, FIXED_COLUMNS};
 use crate::sink::Sink;
+
+/// INSERT 的请求体格式。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum InsertFormat {
+    /// 一行一个 JSON 数组，只有值。INSERT 语句里带列名清单，按位置对上。默认。
+    ///
+    /// 比 [`JsonEachRow`](Self::JsonEachRow) 每行少五百多字节的列名（35 个列名约占
+    /// 一行未压缩体积的四成），本地少序列化、少压缩，服务端也不用逐行按 key 找列。
+    #[default]
+    JsonCompactEachRow,
+    /// 一行一个 JSON 对象，带列名。表里没有的字段靠 `input_format_skip_unknown_fields`
+    /// 跳过。留着做退路：中间有代理改写 SQL、或者想肉眼看请求体的时候用。
+    JsonEachRow,
+}
+
+impl InsertFormat {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            InsertFormat::JsonCompactEachRow => "JSONCompactEachRow",
+            InsertFormat::JsonEachRow => "JSONEachRow",
+        }
+    }
+}
+
+/// 序列化时每攒多少行就往压缩器里灌一次并让出一次调度。
+///
+/// 序列化和 gzip 都是同步 CPU 活，直接在 tokio worker 上一口气做完 20k 行要上百毫秒，
+/// 同一个 worker 上排着的 gRPC 解码、应答全得等着。切成小块，每块几百微秒，中间
+/// `yield_now` 让别的任务插进来。顺带也不用再攥着一份几十 MB 的未压缩 body。
+const ROWS_PER_CHUNK: usize = 256;
 
 /// `start_timestamp` 之后、`exemplars.*` 之前的固定列。两个时间戳列的类型跟着
 /// `timezone` 走，不在这里。
@@ -110,6 +140,7 @@ pub struct ClickhouseSink {
     timeout: Duration,
     async_insert: bool,
     compress: bool,
+    insert_format: InsertFormat,
 }
 
 impl ClickhouseSink {
@@ -119,8 +150,15 @@ impl ClickhouseSink {
         database: impl Into<String>,
         table: impl Into<String>,
     ) -> Self {
+        // 空闲连接留得比 ClickHouse 的 keep_alive_timeout（默认 10s 上下，老版本 3s）短：
+        // 不然低流量时段的第一条 INSERT 会撞上服务端已经关掉的连接，POST 不会被 hyper
+        // 自动重试，结果是一次假的写入失败加 500ms 退避。宁可多握一次手。
+        let client = reqwest::Client::builder()
+            .pool_idle_timeout(Duration::from_secs(2))
+            .build()
+            .expect("构造 reqwest 客户端");
         Self {
-            client: reqwest::Client::new(),
+            client,
             endpoint: endpoint.into().trim_end_matches('/').to_owned(),
             database: database.into(),
             table: table.into(),
@@ -135,7 +173,14 @@ impl ClickhouseSink {
             timeout: Duration::from_secs(30),
             async_insert: false,
             compress: true,
+            insert_format: InsertFormat::default(),
         }
+    }
+
+    /// INSERT 请求体用哪种格式，默认 [`InsertFormat::JsonCompactEachRow`]。
+    pub fn insert_format(mut self, format: InsertFormat) -> Self {
+        self.insert_format = format;
+        self
     }
 
     /// ClickHouse 集群名（`system.clusters` 里的那个，不是 k8s 集群）。
@@ -424,33 +469,68 @@ impl ClickhouseSink {
         format!("{}_local", self.table)
     }
 
-    /// 执行任意 SQL（建表、查询都可以）。
-    pub async fn execute(&self, sql: &str) -> Result<String> {
-        self.request(sql, Vec::new()).await
+    /// INSERT 时写哪几列、按什么顺序：固定列（[`FIXED_COLUMNS`]）再接静态字段列。
+    /// `JSONCompactEachRow` 的每一行就按这个顺序给值。
+    pub fn insert_columns(&self) -> Vec<String> {
+        FIXED_COLUMNS
+            .iter()
+            .map(|name| (*name).to_owned())
+            .chain(self.extra_columns.iter().map(|(name, _)| name.clone()))
+            .collect()
     }
 
-    async fn request(&self, sql: &str, body: Vec<u8>) -> Result<String> {
+    /// INSERT 语句。紧凑格式带列名清单（Nested 的子列 `exemplars.value` 反引号包着
+    /// 就能点名），对象格式让服务端自己按 key 对。
+    fn insert_sql(&self) -> String {
+        match self.insert_format {
+            InsertFormat::JsonCompactEachRow => {
+                let columns: Vec<String> = self
+                    .insert_columns()
+                    .into_iter()
+                    .map(|name| format!("`{name}`"))
+                    .collect();
+                format!(
+                    "INSERT INTO `{}`.`{}` ({}) FORMAT JSONCompactEachRow",
+                    self.database,
+                    self.table,
+                    columns.join(", ")
+                )
+            }
+            InsertFormat::JsonEachRow => format!(
+                "INSERT INTO `{}`.`{}` FORMAT JSONEachRow",
+                self.database, self.table
+            ),
+        }
+    }
+
+    /// 执行任意 SQL（建表、查询都可以）。
+    pub async fn execute(&self, sql: &str) -> Result<String> {
+        self.request(sql, Vec::new(), false).await
+    }
+
+    /// `compressed` 说明 `body` 已经是 gzip 过的。空 body（`SELECT 1`、`EXISTS TABLE`
+    /// 这些健康检查）一律不压：gzip 一个空串反而会多出十几个字节的头，而这里正是
+    /// 411 那个坑所在，保持原样最稳。
+    async fn request(&self, sql: &str, body: Vec<u8>, compressed: bool) -> Result<String> {
         let mut settings: Vec<(&str, &str)> = vec![
             ("query", sql),
             // 时间戳按 `2026-09-07 03:04:08.914293456+00:00` 发送，要开宽松解析
             ("date_time_input_format", "best_effort"),
-            // 事件里的自定义字段可能没有对应列，跳过而不是整批失败。
-            ("input_format_skip_unknown_fields", "1"),
             // 指标的值可能是 NaN / Inf（Prometheus 的 staleness marker、除零得到的
             // 速率……），而 JSON 里没有这几个字面量的写法，serde 会写成 null。没有这个
             // 设置的话整批插入会因为「Float64 列收到 null」失败 —— 一条脏数据带走一批。
             // 代价是这些点落库成 0，要区分的话看 flags 那一列。
             ("input_format_null_as_default", "1"),
         ];
+        if self.insert_format == InsertFormat::JsonEachRow {
+            // 事件里的自定义字段可能没有对应列，跳过而不是整批失败。紧凑格式没有
+            // key，写哪几列是 INSERT 语句说了算，用不上这条。
+            settings.push(("input_format_skip_unknown_fields", "1"));
+        }
         if self.async_insert {
             settings.push(("async_insert", "1"));
             settings.push(("wait_for_async_insert", "1"));
         }
-
-        // 空 body（`SELECT 1`、`EXISTS TABLE` 这些健康检查）不压：gzip 一个空串反而
-        // 会多出十几个字节的头，而这里正是 411 那个坑所在，保持原样最稳。
-        let compressed = self.compress && !body.is_empty();
-        let body = if compressed { gzip(&body)? } else { body };
 
         // Content-Length 必须自己写。body 为空时 hyper 认为流已经结束，既不发
         // Content-Length 也不用 chunked，而 ClickHouse 见到这样的 POST 直接回
@@ -512,21 +592,51 @@ fn escape_literal(raw: &str) -> String {
     raw.replace('\\', "\\\\").replace('\'', "\\'")
 }
 
-/// 压缩请求体。ClickHouse 见到 `Content-Encoding: gzip` 会自己解开，服务端不用开
-/// 任何设置 —— `enable_http_compression` 管的是响应方向，跟这里无关。
+/// 攒 INSERT 请求体：要压就边序列化边喂给 gzip，不压就原样堆着。
 ///
-/// 压缩级别取最快的那一档：多压那百分之十几的体积要多花几倍 CPU，不划算。
-fn gzip(body: &[u8]) -> Result<Vec<u8>> {
-    let mut encoder = flate2::write::GzEncoder::new(
-        Vec::with_capacity(body.len() / 8),
-        flate2::Compression::fast(),
-    );
-    encoder
-        .write_all(body)
-        .map_err(|err| Error::io("压缩 ClickHouse 请求体失败".to_owned(), err))?;
-    encoder
-        .finish()
-        .map_err(|err| Error::io("压缩 ClickHouse 请求体失败".to_owned(), err))
+/// ClickHouse 见到 `Content-Encoding: gzip` 会自己解开，服务端不用开任何设置 ——
+/// `enable_http_compression` 管的是响应方向，跟这里无关。压缩级别取最快的那一档：
+/// 多压那百分之十几的体积要多花几倍 CPU，不划算。
+enum BodyBuffer {
+    Gzip(flate2::write::GzEncoder<Vec<u8>>),
+    Plain(Vec<u8>),
+}
+
+impl BodyBuffer {
+    fn new(compress: bool, rows: usize) -> Self {
+        if compress {
+            // 指标行压得很动（三十倍上下），每行留 64 字节的输出空间够了
+            BodyBuffer::Gzip(flate2::write::GzEncoder::new(
+                Vec::with_capacity(rows * 64),
+                flate2::Compression::fast(),
+            ))
+        } else {
+            BodyBuffer::Plain(Vec::with_capacity(rows * 1024))
+        }
+    }
+
+    fn push(&mut self, chunk: &[u8]) -> Result<()> {
+        match self {
+            BodyBuffer::Gzip(encoder) => encoder
+                .write_all(chunk)
+                .map_err(|err| Error::io("压缩 ClickHouse 请求体失败".to_owned(), err)),
+            BodyBuffer::Plain(buf) => {
+                buf.extend_from_slice(chunk);
+                Ok(())
+            }
+        }
+    }
+
+    /// 交出请求体和「压过了没」。
+    fn finish(self) -> Result<(Vec<u8>, bool)> {
+        match self {
+            BodyBuffer::Gzip(encoder) => encoder
+                .finish()
+                .map(|body| (body, true))
+                .map_err(|err| Error::io("压缩 ClickHouse 请求体失败".to_owned(), err)),
+            BodyBuffer::Plain(buf) => Ok((buf, false)),
+        }
+    }
 }
 
 #[async_trait]
@@ -534,19 +644,47 @@ impl Sink for ClickhouseSink {
     async fn write(&mut self, events: &[MetricEvent]) -> Result<()> {
         // 时间戳一律带偏移；没配时区就按 UTC 换算
         let tz = self.timezone.unwrap_or(Tz::UTC);
-        let mut body: Vec<u8> = Vec::with_capacity(events.len() * 512);
-        for event in events {
-            serde_json::to_writer(&mut body, &WithZone { event, tz })?;
-            body.push(b'\n');
+        let extra: Vec<String> = self
+            .extra_columns
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect();
+
+        let mut body = BodyBuffer::new(self.compress, events.len());
+        let mut chunk: Vec<u8> = Vec::with_capacity(ROWS_PER_CHUNK * 1024);
+        for rows in events.chunks(ROWS_PER_CHUNK) {
+            for event in rows {
+                match self.insert_format {
+                    InsertFormat::JsonCompactEachRow => serde_json::to_writer(
+                        &mut chunk,
+                        &CompactRow {
+                            event,
+                            tz,
+                            extra: &extra,
+                        },
+                    )?,
+                    InsertFormat::JsonEachRow => {
+                        serde_json::to_writer(&mut chunk, &WithZone { event, tz })?
+                    }
+                }
+                chunk.push(b'\n');
+            }
+            body.push(&chunk)?;
+            chunk.clear();
+            // 让同一个 worker 上排队的别的任务（收请求、回应答）插进来
+            tokio::task::yield_now().await;
         }
+        let (body, compressed) = body.finish()?;
 
-        let sql = format!(
-            "INSERT INTO `{}`.`{}` FORMAT JSONEachRow",
-            self.database, self.table
+        let sql = self.insert_sql();
+        self.request(&sql, body, compressed).await?;
+
+        tracing::debug!(
+            count = events.len(),
+            table = %self.table,
+            format = self.insert_format.as_str(),
+            "已写入 ClickHouse"
         );
-        self.request(&sql, body).await?;
-
-        tracing::debug!(count = events.len(), table = %self.table, "已写入 ClickHouse");
         Ok(())
     }
 
@@ -716,6 +854,38 @@ mod tests {
         assert!(!ddl.contains("MODIFY COLUMN"), "没配时区别去动列: {ddl}");
         // main 会在末尾补分号，这里不能自带
         assert!(!ddl.trim_end().ends_with(';'), "{ddl}");
+    }
+
+    /// 建表的列顺序、INSERT 的列清单、`CompactRow` 写值的顺序三者必须一致：紧凑格式
+    /// 只按位置对，错一位就是把 `sum` 写进 `min`。
+    #[test]
+    fn table_columns_follow_the_fixed_column_order() {
+        let sink = ClickhouseSink::new("http://127.0.0.1:8123", "logs", "otel_metric")
+            .extra_columns(vec![
+                ("cluster".to_owned(), "LowCardinality(String)".to_owned()),
+                ("env".to_owned(), "LowCardinality(String)".to_owned()),
+            ]);
+        let base: Vec<String> = sink.base_columns().into_iter().map(|(n, _)| n).collect();
+        assert_eq!(base, FIXED_COLUMNS);
+
+        let columns = sink.insert_columns();
+        assert_eq!(columns.len(), FIXED_COLUMNS.len() + 2);
+        assert_eq!(&columns[FIXED_COLUMNS.len()..], ["cluster", "env"]);
+
+        let sql = sink.insert_sql();
+        assert!(
+            sql.starts_with("INSERT INTO `logs`.`otel_metric` (`timestamp`, `start_timestamp`, "),
+            "{sql}"
+        );
+        assert!(
+            sql.contains(
+                "`exemplars.attributes`, `flags`, `cluster`, `env`) FORMAT JSONCompactEachRow"
+            ),
+            "{sql}"
+        );
+
+        let plain = sink.insert_format(InsertFormat::JsonEachRow).insert_sql();
+        assert_eq!(plain, "INSERT INTO `logs`.`otel_metric` FORMAT JSONEachRow");
     }
 
     #[test]

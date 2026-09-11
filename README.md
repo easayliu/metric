@@ -173,6 +173,7 @@ fields:            # 附加到每个数据点的静态字段
 | `max_request_bytes` | 16 MiB | 单个请求（解压后）的上限，超过回 `PAYLOAD_TOO_LARGE` |
 | `enqueue_timeout_secs` | 5 | 下游队列满时最多等多久，超时回 gRPC `UNAVAILABLE` / HTTP `503 + Retry-After` |
 | `wait_for_write` | `false` | 见下面「投递语义」 |
+| `write_timeout_secs` | 8 | `wait_for_write` 时最多等落库多久，超时回「稍后重试」；要比客户端的导出超时短（SDK 默认 10s） |
 
 拒收一律回「可重试」的状态码，这是 OTLP 规定的应答方式：SDK 自带指数退避重发，比把数据堆在
 接收端内存里稳。坏请求（解析不了、不认的 Content-Type）回 400 / 415，SDK 不会重发。
@@ -371,8 +372,16 @@ ClickHouse 数据源的 Time series 模式：查询给出 `time` 列和一个数
 * **`wait_for_write: true`**：等数据**真正写进存储**再回成功。写失败会反映成 SDK 那边的导出失败，
   SDK 自己重发，等于没有磁盘缓冲也有「至少一次」。代价是每个导出请求多等一个攒批周期
   （`batch.timeout_secs`）加一次写入的时间，SDK 的导出超时（默认 10s）要比这个长。
-* 背压：source 与 sink 之间是有界队列（`pipeline.buffer`），存储慢下来时新请求会在队列口等
-  `enqueue_timeout_secs`，等不到就回「稍后重试」，不会把内存吃光。
+  等待有上限（`write_timeout_secs`，默认 8s）：存储抖动、写入在退避重试的那几十秒里，
+  不能让所有连接一起挂着 —— 超时回「稍后重试」，但这批数据仍在队列里、最终还是会写进去，
+  客户端重发的那份就是重复行。
+* 背压：source 与 sink 之间的队列有两道闸 —— 按批数（`pipeline.buffer`）和按**数据点总数**
+  （`pipeline.max_queued_events`，默认 10 万）。后者才是内存上界：一个数据点连属性在内存里
+  约 1 KB，一次导出请求动辄上万个点，光数批数限不住。存储慢下来时新请求在队列口等
+  `enqueue_timeout_secs`，等不到就回「稍后重试」。进程的常驻内存大致是
+  `max_queued_events + 2 × batch.max_events` 个点。
+* 运行统计：每 `pipeline.stats_interval_secs`（默认 30s）打一条 info，带这段时间收了多少批 /
+  多少点、写了多少、写一次平均 / 最长多久、队列里压了多少。线上说「慢」先看它。
 * 写入可能被重试，所以同一批数据点可能重复入库（表是 MergeTree，重复行不会合并）。
   指标是 Cumulative 的话重复行对 `max` / 差分没影响；确实要去重就换 `ReplacingMergeTree`
   并把时间线的标识加进排序键 —— 改 `--ddl` 输出的 SQL 就行，程序不关心。
@@ -391,14 +400,31 @@ kubectl apply -f deploy/metricpipe-deployment.yaml
 
 # 2. 建库建表（挂的是同一个 ConfigMap，列不会和采集端对不上）
 kubectl apply -f deploy/metricpipe-ddl-job.yaml
-kubectl -n monitoring wait --for=condition=complete job/metricpipe-ddl --timeout=180s
+kubectl -n logging wait --for=condition=complete job/metricpipe-ddl --timeout=180s
 
 # 3. 让第 1 步已经起来的 Pod 立刻重试，不用等 CrashLoop 退避
-kubectl -n monitoring rollout restart deployment/metricpipe
+kubectl -n logging rollout restart deployment/metricpipe
 ```
 
 然后应用的 `OTEL_EXPORTER_OTLP_ENDPOINT` 指到
-`http://metricpipe.monitoring.svc.cluster.local:4317`。
+`http://metricpipe.logging.svc.cluster.local:4317`。
+
+**集群里已经有 OTel collector 的话**，别让应用绕过它，直接把 collector 的 metrics pipeline
+多接一个出口：`deploy/otel-collector.yaml` 就是改好的 CR（在现有 exporters 上加
+`otlp/metricpipe`，`prometheus` 那路保留，两边并行跑一段时间再决定撤不撤）。
+
+```bash
+kubectl apply -f deploy/otel-collector.yaml
+```
+
+两个坑写在那个文件的注释里，这里重复一遍最要命的：
+
+* **exporter 必须指 headless Service**（`metricpipe-headless`，`deploy/metricpipe-deployment.yaml`
+  里已经带了）并且配 `balancer_name: round_robin`。普通 ClusterIP 的 DNS 只有一条 VIP 记录，
+  gRPC 建一条长连接、kube-proxy 按连接钉死一个 Pod——副本配几个都只有一个在干活。
+* 那个 CR 和 tracepipe 仓库里的 `deploy/otel-collector.yaml` **是同一个对象**
+  （`observability/jaeger-otel`）。谁后 apply 谁生效，拿只有 tracepipe exporter 的旧文件
+  盖上去，指标这条链路就静悄悄断了。两份要一起改。
 
 Job 里 `apply-ddl` 容器的 `CH_HOST` / `CH_DATABASE` / `CH_CLUSTER` / `CH_USER` / `CH_PASSWORD`
 要和 ConfigMap 里 sink 的对上。**改了配置里的 `fields` 或 `timezone` 就重跑一次 Job**。
@@ -406,12 +432,15 @@ Job 里 `apply-ddl` 容器的 `CH_HOST` / `CH_DATABASE` / `CH_CLUSTER` / `CH_USE
 不想在集群里跑 Job 的话，`--ddl` 不连库，本地也能渲染：
 
 ```bash
-kubectl -n monitoring get cm metricpipe-config -o jsonpath='{.data.metricpipe\.yaml}' > /tmp/metricpipe.yaml
+kubectl -n logging get cm metricpipe-config -o jsonpath='{.data.metricpipe\.yaml}' > /tmp/metricpipe.yaml
 docker run --rm -v /tmp/metricpipe.yaml:/etc/metricpipe/metricpipe.yaml:ro \
-  ghcr.io/easayliu/metric:v0.1.0 --ddl /etc/metricpipe/metricpipe.yaml
+  ghcr.io/easayliu/metric:v0.2.0 --ddl /etc/metricpipe/metricpipe.yaml
 ```
 
-要点：多副本各自小批量写，`async_insert: true` 让 ClickHouse 服务端再攒一层；
+要点：`async_insert` 不用开 —— 这边每批已经攒到两万行，体积超过服务端
+`async_insert_max_data_size`，开了只是多一次拷贝加 `wait_for_async_insert` 的等待，还直接算进
+`wait_for_write` 的应答延迟；两个副本每 2s 一批远够不上 too many parts。
+`pipeline.max_queued_events` 和容器的 memory limit 对着调（10 万个点约 100 MB）；
 `terminationGracePeriodSeconds` 留够（滚动更新时正在等 `wait_for_write` 的请求要写完）；
 Service 前面走 gRPC 的话注意 k8s Service 是按连接负载均衡的，一个 SDK 的长连接只打到一个副本 ——
 副本数按「够用」配，不是按均摊算。
@@ -473,7 +502,7 @@ pub trait Sink: Send + Sync + 'static {
 | --- | --- | --- |
 | source | `OtlpSource` | OTLP/gRPC + OTLP/HTTP 接收端，gzip、大小上限、队列背压 |
 | source | `StdinSource` | 读 OTLP/JSON 行，调试 / 回放用 |
-| sink | `ClickhouseSink` | HTTP `JSONEachRow` 批量插入，gzip 请求体 |
+| sink | `ClickhouseSink` | HTTP `JSONCompactEachRow` 批量插入（列名写在 INSERT 语句里，每行只有值），边序列化边 gzip；`insert_format: json_each_row` 可退回带列名的写法 |
 | sink | `ConsoleSink` | JSON / 摘要文本输出 |
 | sink | `MemorySink` | 测试用 |
 
