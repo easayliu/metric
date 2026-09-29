@@ -46,7 +46,7 @@ OTel collector 的 [clickhouse exporter](https://github.com/open-telemetry/opent
 | `bucket_counts` / `explicit_bounds` | Histogram | 桶计数比上界多一个（最后一个是上界之外的） |
 | `scale` / `zero_count` / `zero_threshold` / `positive_*` / `negative_*` | ExponentialHistogram | 指数桶，base = 2^(2^-scale) |
 | `quantiles.*` | Summary | `Nested`：`quantile` / `value` 两个等长数组 |
-| `exemplars.*` | 数据点 exemplars | `Nested`：`timestamp` / `value` / `trace_id` / `span_id` / `attributes` |
+| `exemplars.*` | 数据点 exemplars | `Nested`：`timestamp` / `value` / `trace_id` / `span_id` / `attributes`。**一个点最多留 32 个**（`MAX_EXEMPLARS_PER_POINT`，等距抽样），上游该自己限：spanmetrics 配 `exemplars.max_per_data_point`，不配就是「一个周期内的全部」，线上实测一个点带过 4 万个、指标表 82% 的盘是这三列 |
 | `flags` | `flags` | bit 0 = 这条时间线没数据（Prometheus 的 staleness marker） |
 
 属性保留 OTLP 里的类型：字符串、整数、小数、布尔原样，bytes 转 base64 串，数组和嵌套对象就是
@@ -233,7 +233,7 @@ CREATE TABLE IF NOT EXISTS `logs`.`otel_metric`
     `metric_name`            LowCardinality(String),
     `metric_type`            LowCardinality(String),
     `metric_unit`            LowCardinality(String),
-    `metric_description`     String,
+    `metric_description`     LowCardinality(String),
     `service_name`           LowCardinality(String),
     `scope_name`             LowCardinality(String),
     `scope_version`          LowCardinality(String),
@@ -270,7 +270,8 @@ CREATE TABLE IF NOT EXISTS `logs`.`otel_metric`
 ENGINE = MergeTree
 PARTITION BY toDate(`timestamp`)
 ORDER BY (`service_name`, `metric_name`, toDateTime(`timestamp`))
-TTL toDateTime(`timestamp`) + INTERVAL 30 DAY;
+TTL toDateTime(`timestamp`) + INTERVAL 30 DAY
+SETTINGS ttl_only_drop_parts = 1;
 
 ALTER TABLE `logs`.`otel_metric`
     ADD COLUMN IF NOT EXISTS `start_timestamp` DateTime64(9, 'Asia/Shanghai'),

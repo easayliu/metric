@@ -227,9 +227,18 @@ fn summary_point(point: SummaryDataPoint, context: &Context) -> MetricEvent {
     event
 }
 
+/// 一个数据点最多保留多少个 exemplar。上游该自己限（spanmetrics 的 `max_per_data_point`、
+/// SDK 的 reservoir），这里是兜底：2026-09-29 线上 collector 没配上限，spanmetrics 的
+/// `duration` 直方图一个点带 41343 个 exemplar，五分钟 218 万个，指标表 82% 的盘是
+/// `exemplars.*` 三列。超出的按等距抽样留下，头尾都保住，不是只留前几个。
+pub const MAX_EXEMPLARS_PER_POINT: usize = 32;
+
 fn exemplars(list: Vec<opentelemetry_proto::tonic::metrics::v1::Exemplar>) -> Vec<Exemplar> {
+    let total = list.len();
     list.into_iter()
-        .map(|e| Exemplar {
+        .enumerate()
+        .filter(|(i, _)| keep_exemplar(*i, total, MAX_EXEMPLARS_PER_POINT))
+        .map(|(_, e)| Exemplar {
             timestamp: e.time_unix_nano,
             value: match e.value {
                 Some(exemplar::Value::AsDouble(value)) => value,
@@ -241,6 +250,17 @@ fn exemplars(list: Vec<opentelemetry_proto::tonic::metrics::v1::Exemplar>) -> Ve
             attributes: attributes(e.filtered_attributes),
         })
         .collect()
+}
+
+/// `total` 个里等距留 `limit` 个：第 `i` 个留不留看它是不是某个抽样槽的第一个。
+/// `total <= limit` 全留。
+fn keep_exemplar(i: usize, total: usize, limit: usize) -> bool {
+    if total <= limit {
+        return true;
+    }
+    // 槽号 = i * limit / total；和前一个的槽号不同就是这个槽的第一个
+    let slot = |k: usize| k * limit / total;
+    i == 0 || slot(i) != slot(i - 1)
 }
 
 /// 原始 id 字节 → 小写 hex。OTLP 里 trace id 是 16 字节、span id 是 8 字节，所以出来
@@ -525,6 +545,24 @@ mod tests {
                 schema_url: String::new(),
             }],
         }
+    }
+
+    #[test]
+    fn exemplars_are_capped_by_even_sampling() {
+        let kept = |total: usize, limit: usize| -> Vec<usize> {
+            (0..total)
+                .filter(|i| keep_exemplar(*i, total, limit))
+                .collect()
+        };
+        assert_eq!(kept(5, 32), vec![0, 1, 2, 3, 4]);
+        assert_eq!(kept(32, 32).len(), 32);
+        assert_eq!(kept(33, 32).len(), 32);
+        assert_eq!(kept(8, 4), vec![0, 2, 4, 6]);
+        assert_eq!(kept(41343, 32).len(), 32);
+        // 头一个一定在；最后一个槽落在尾部
+        let k = kept(1000, 32);
+        assert_eq!(k[0], 0);
+        assert!(*k.last().unwrap() >= 1000 - 1000 / 32, "{k:?}");
     }
 
     #[test]

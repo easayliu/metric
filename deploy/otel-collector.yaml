@@ -1,17 +1,18 @@
-# 现有的 OTel collector（opentelemetry-operator 管理的 jaeger-otel）改成把**指标**
-# 也发给 metricpipe：metrics pipeline 的 exporters 里加一个 otlp exporter 指向
-# metricpipe 的 gRPC 4317。receiver、spanmetrics、prometheus 都不动，也不改
-# ports / replicas（这是出站连接）。
+# opentelemetry-operator 管理的 jaeger-otel collector：trace 出到 tracepipe，
+# 指标出到 metricpipe，两条链路都在这一份文件里。
 #
-# ⚠️ 这个 CR 和 tracepipe 仓库里的 deploy/otel-collector.yaml 是**同一个对象**
-# （observability/jaeger-otel）。两边内容必须保持一致 —— 谁后 apply 谁的版本生效，
-# 拿一份只有 tracepipe exporter 的旧文件覆盖上去，指标那条链路就静悄悄断了。这份文件
-# 里两个 exporter 都留着，改完记得把 trace 仓库那份同步过去（或者干脆只留一份，
-# 两个仓库都软链到它）。
+# ⚠️⚠️ 这份文件在 **metric 和 trace 两个仓库里各有一份**，对应集群里的**同一个对象**
+# （observability/jaeger-otel）。两份必须**逐字一致** —— 谁后 apply 谁的版本生效，
+# 拿一份旧的覆盖上去，另一条链路就静悄悄断了（比如只有 tracepipe exporter 的旧版本，
+# 会把整条指标入库摘掉，而且没有任何报错）。
 #
-# 上线顺序：先起 metricpipe（ddl Job -> Deployment -> headless Service，见 README），
-# Pod ready 后再 apply 这个。collector 找不到 metricpipe 时会在 sending_queue 里
-# 退避重试，队列满了才丢。
+# 所以这份头注释是**中立的**：两边内容逐字相同，同步就是一条 cp，不需要任何编辑。
+#   cp <本文件> <另一个仓库>/deploy/otel-collector.yaml
+# 改完立刻 cp 过去，别隔天、别手动在第二个仓库里重改一遍。
+#
+# 上线顺序：先起 metricpipe / tracepipe（ddl Job -> Deployment -> headless Service，
+# 见各自 README），Pod ready 后再 apply 这个。collector 找不到对端时会在
+# sending_queue 里退避重试，队列满了才丢。
 #
 # 这份文件去掉了 status / managedFields / resourceVersion 这些服务端字段和 Rancher 的
 # objectset 注解；如果这个 CR 是 fleet 下发的，改 fleet 仓库里的那份，别直接 apply。
@@ -28,11 +29,21 @@ spec:
   image: harbor-intranet.afanticar.com/hub/otel/opentelemetry-collector-contrib:0.81.0
   ingress:
     route: {}
-  ports:
-    - name: metrics
-      port: 8889
-      protocol: TCP
-      targetPort: 0
+  # 原来这里开着 8889 给 prometheus exporter 用。exporter 撤掉之后没人监听了，端口
+  # 一并删掉，免得 Service 上留一个指向空处的口。
+  # ⚠️ 记得把抓 8889 的那份 ServiceMonitor / prometheus scrape config 也删掉，
+  # 否则那边会一直报抓取失败。
+  # collector 自己的内部指标不在这个口上：operator 另外建的 jaeger-otel-collector-monitoring
+  # Service 走 8888，那个不受影响，下面验证用的就是它
+  # Go 的 GC 只看自己的堆，不知道 cgroup 上限在哪，涨到很高才回收一次；而
+  # memory_limiter 开始拒收的是**软上限 = limit_percentage - spike_limit_percentage**
+  # = 75% - 15% = 60% ≈ 2.4Gi（75% 那条是硬上限，到那儿才强制 GC）。所以 GC 的目标
+  # 必须低于 2.4Gi，否则拒收仍然发生在 GC 之前。
+  # 注意这只对「能回收的垃圾」有效：spanmetrics 那种常驻 series 是活对象，GC 再积极
+  # 也放不掉，那个要靠下面 connectors 的配置。改 resources.limits 的话这里跟着改。
+  env:
+    - name: GOMEMLIMIT
+      value: 2GiB
   resources:
     limits:
       cpu: "2"
@@ -51,8 +62,10 @@ spec:
           http:
 
     exporters:
-      prometheus:
-        endpoint: "0.0.0.0:8889"
+      # prometheus exporter 已移除。指标入库走 otlp/metricpipe 这一条，不再对外暴露
+      # 可抓取的端点。顺带也拿掉了它的内存开销：那个 exporter 会把见过的 series 全留在
+      # 内存里等着被抓，spanmetrics 开 cumulative 时全量 series 每 15s 重推一遍、
+      # 永不过期，等于把同一份增长又存了第二份
       logging:
       # 指标入库。和下面 otlp/tracepipe 同一套写法，只是端点和队列大小按指标的量调过
       otlp/metricpipe:
@@ -69,9 +82,10 @@ spec:
           insecure: true
         # metricpipe 两个入口都收 gzip
         compression: gzip
-        # metricpipe 开了 wait_for_write 时，一次导出要等一个攒批周期 + 一次 ClickHouse
-        # 写入，默认 5s 有点紧
-        timeout: 15s
+        # metricpipe 关掉了 wait_for_write，收下进队列就回 OK，正常是毫秒级；5s 还没回
+        # 说明它队列满了或者卡住了，早点失败早点退避重试比挂在这儿强。
+        # metricpipe 改回 wait_for_write: true 的话这里要放回 15s
+        timeout: 5s
         # metricpipe 队列满 / 落库失败回 UNAVAILABLE，这里退避重发，
         # 等于没有磁盘缓冲也至少一次
         retry_on_failure:
@@ -81,11 +95,16 @@ spec:
           max_elapsed_time: 300s
         sending_queue:
           enabled: true
-          # 指标是按上报周期成批来的（SDK 默认 60s 一次），并发压力比 span 小一到两个
-          # 数量级，4 个 consumer 够用
+          # 之前抬到 16 是在补偿 wait_for_write 的应答延迟（一个 consumer 要等「攒批
+          # 周期 + 一次 ClickHouse 写入」才腾得出手）。metricpipe 关掉 wait_for_write
+          # 之后单次导出是毫秒级，4 个 consumer 的吞吐远够，而且并发越低，metricpipe
+          # 那边同时在解码的请求越少（它在拿队列名额之前就把整个请求解成事件了，
+          # 这部分不在它 max_queued_events 的账里）
           num_consumers: 4
-          # 单位是「批数」不是数据点数
-          queue_size: 1000
+          # 单位是「批数」不是数据点数：1000 批 × send_batch_size 10000 = 一千万个点
+          # 挂在内存里，本身就顶穿 memory_limiter 的软上限。现在队列消得快，
+          # 深度不用留这么深
+          queue_size: 500
       otlp/tracepipe:
         # 同上，指向 tracepipe 的 headless Service
         endpoint: dns:///tracepipe-headless.logging.svc.cluster.local:4317
@@ -93,6 +112,14 @@ spec:
         tls:
           insecure: true
         compression: gzip
+        # tracepipe 开着 wait_for_write（收下还不算数，写进 ClickHouse 才回 OK），
+        # 所以这里要留出一个攒批周期加一次 INSERT 的时间。
+        # ⚠️ 这个值必须**大于** tracepipe 的 source.write_timeout_secs（现在是 10s）：
+        # 落库变慢时先到点的得是 tracepipe，它回可重试的 UNAVAILABLE，下面的
+        # retry_on_failure 退避重发，consumer 名额立刻还回来。反过来这边先超时的话，
+        # 拿到的是 DeadlineExceeded：请求还挂在 tracepipe 那侧，consumer 名额一直占着，
+        # sending_queue 很快堆满，然后就是整批整批地 "Dropping data"。
+        # 两边任何一个改了都要回来对一眼
         timeout: 15s
         retry_on_failure:
           enabled: true
@@ -102,11 +129,16 @@ spec:
         sending_queue:
           enabled: true
           # 并发导出数，也就是同时压在几个 tracepipe 副本上。4 个 consumer 在 8k span/s
-          # 下排队，配合 round_robin 抬到 16
+          # 下排队，配合 round_robin 抬到 16。
+          # 注意这 16 个请求在对端是被 tracepipe 的 pipeline.write_concurrency（4/副本，
+          # 2 个副本 = 8）消化的：那边串行写的话，consumer 开再多也只是一起排队等同一个
+          # 写入任务，每个请求的延迟反而被拉长到超时 —— 两个数要一起看
           num_consumers: 16
-          # 单位是「批数」不是 span 数：1000 批 × send_batch_size 10000 已经是千万级
-          # span 挂在内存里，别再往上加 —— 抗抖动靠下面的 memory_limiter，不是靠堆队列
-          queue_size: 1000
+          # 单位是「批数」不是 span 数：1000 批 × send_batch_size 10000 是千万级 span
+          # 挂在内存里，光这一个队列就能把 4Gi 吃满。traces 和 metrics 共用一个进程，
+          # 这里堆得越深，metrics pipeline 越容易被 memory_limiter 误伤，所以往下压到
+          # 300 —— 抗抖动靠 memory_limiter 和 tracepipe 的重发，不是靠堆队列
+          queue_size: 300
       # 切换期间想双写就把 jaeger 放开，traces pipeline 的 exporters 里两个都列上；
       # 确认 logs.otel_trace 里数据正常后再删掉
       jaeger:
@@ -127,10 +159,35 @@ spec:
       # 注意 metrics pipeline 里这个数算的是**数据点**，不是指标条数
       batch:
         send_batch_size: 10000
+        # 必须配：send_batch_size 只是**触发**阈值，不切分 —— 上游来一个超大批次会原样
+        # 透传，既让「queue_size × send_batch_size」的内存估算失效，又可能超过
+        # metricpipe / tracepipe 16 MiB 的 max_request_bytes，被 gRPC 直接拒掉
+        send_batch_max_size: 10000
         timeout: 1s
 
     connectors:
       spanmetrics:
+        # ★ 这条是「跑十小时就报内存不够、重启又好」的根治。
+        # 默认是 AGGREGATION_TEMPORALITY_CUMULATIVE：每出现一个新的
+        # (service, span name, kind, status_code) 组合，就在进程里长出一个 histogram，
+        # **只增不减，直到重启** —— 这是活对象，GC 回收不掉，GOMEMLIMIT 也压不住，
+        # 十小时攒够就顶穿 memory_limiter 的软上限，然后一直拒收。队列参数调多少都没用。
+        # 改成 DELTA 之后，每个 flush 周期（默认 15s）推完就把累积的 map 清空，
+        # 内存变成「一个周期内的活跃 series」，有界。
+        # 代价一：delta 喂不了 prometheus exporter，所以下面 metrics pipeline 拆成两条。
+        # 代价二：落到 logs.otel_metric 里的 temporality 列从 Cumulative 变 Delta，
+        # 算 rate 的写法要改（delta 更简单：直接 sum(count)/时间窗，不用处理 counter reset）
+        aggregation_temporality: AGGREGATION_TEMPORALITY_DELTA
+        # 显式写出（默认 1000）：span name 里混进 URL 里的 ID、SQL 原文这类高基数值时，
+        # 这里是最后一道闸。真要靠它兜底说明上游该规范化 span name 了
+        dimensions_cache_size: 1000
+        # exemplar 必须给上限。不写 max_per_data_point 就是「一个周期内的全部」：线上实测
+        # 2026-09-29 五分钟里 218 万个 exemplar 有 213 万来自这里的 duration 直方图，热点
+        # span 一个数据点带 4 万多个 trace id，指标表 82% 的盘是这几列。5 个够定位尖峰
+        # 落在哪条 trace，再多也是同一批 span
+        exemplars:
+          enabled: true
+          max_per_data_point: 5
 
     service:
       pipelines:
@@ -142,11 +199,12 @@ spec:
         metrics:
           # otlp = 应用自己上报的指标；spanmetrics = 从 span 算出来的 RED 指标
           # （调用量 / 错误率 / 耗时直方图），两者一起进 logs.otel_metric，
-          # 按 service_name 就能和 otel_trace、app_log 对上
+          # 按 service_name 就能和 otel_trace、app_log 对上。
+          # prometheus 那条出口撤了之后，spanmetrics 不用再迁就它的 cumulative，
+          # 所以上面能放心配 DELTA —— 这两件事是一件事
           receivers: [spanmetrics, otlp]
-          # 原来这条 pipeline 没挂 processors：memory_limiter 保命、batch 攒批，
-          # 和 traces 一样加上
+          # memory_limiter 必须排在最前面，排后面就等于没有保护
           processors: [memory_limiter, batch]
-          # prometheus 那路保留（8889 还在被抓），入库是并行的第二条出口。
-          # 确认 logs.otel_metric 里数据正常、面板切过去之后，再决定要不要撤掉 prometheus
-          exporters: [prometheus, otlp/metricpipe]
+          # 唯一出口。这里失败就是真丢数据了，所以 otlp/metricpipe 那边的
+          # retry_on_failure + sending_queue 不能关
+          exporters: [otlp/metricpipe]

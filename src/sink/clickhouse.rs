@@ -50,7 +50,8 @@ const COLUMNS_HEAD: [(&str, &str); 25] = [
     ("metric_name", "LowCardinality(String)"),
     ("metric_type", "LowCardinality(String)"),
     ("metric_unit", "LowCardinality(String)"),
-    ("metric_description", "String"),
+    // 描述是按指标名固定的几百段文字，String 存一天 30 MiB 重复内容
+    ("metric_description", "LowCardinality(String)"),
     ("service_name", "LowCardinality(String)"),
     ("scope_name", "LowCardinality(String)"),
     ("scope_version", "LowCardinality(String)"),
@@ -375,9 +376,12 @@ impl ClickhouseSink {
         // 排序键按查询的写法来：几乎所有面板都是「某个服务的某个指标，最近一段时间」，
         // 再按标签细分 —— 所以 service_name / metric_name 在前，同一条时间线的点
         // 挨着放，Float64 那几列的压缩率也跟着上去。
+        // ttl_only_drop_parts：按天分区、TTL 按天，到期整个 part 直接丢，不再靠 TTL 合并
+        // 逐行删——那种合并要把几十 GiB 的 part 整个重写一遍。
         let layout = "PARTITION BY toDate(`timestamp`)\n\
              ORDER BY (`service_name`, `metric_name`, toDateTime(`timestamp`))\n\
-             TTL toDateTime(`timestamp`) + INTERVAL 30 DAY";
+             TTL toDateTime(`timestamp`) + INTERVAL 30 DAY\n\
+             SETTINGS ttl_only_drop_parts = 1";
         let db = &self.database;
         let table = &self.table;
         // 老表补时区补不了 `timestamp`：它在排序键和分区键里，ClickHouse 不允许 ALTER
@@ -404,6 +408,8 @@ impl ClickhouseSink {
                         .iter()
                         .map(|(name, expr)| format!("ADD INDEX IF NOT EXISTS `{name}` {expr}")),
                 );
+                // 纯元数据改动，重复执行无副作用；Distributed 表没有这个设置
+                actions.push("MODIFY SETTING ttl_only_drop_parts = 1".to_owned());
             }
             actions.extend(modify_timestamps.iter().cloned());
             format!(
@@ -843,6 +849,11 @@ mod tests {
             );
         }
         assert!(ddl.contains("ORDER BY (`service_name`, `metric_name`, toDateTime(`timestamp`))"));
+        assert!(ddl.contains("SETTINGS ttl_only_drop_parts = 1"), "{ddl}");
+        assert!(
+            ddl.contains("MODIFY SETTING ttl_only_drop_parts = 1"),
+            "{ddl}"
+        );
         assert!(
             !ddl.contains("ADD COLUMN IF NOT EXISTS `timestamp`"),
             "{ddl}"

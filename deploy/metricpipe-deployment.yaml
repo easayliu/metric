@@ -21,10 +21,17 @@ data:
       grpc: 0.0.0.0:4317
       http: 0.0.0.0:4318
       max_request_bytes: 16777216
+      # 队列满时最多等这么久再回 UNAVAILABLE。关掉 wait_for_write 之后，这是**唯一**的
+      # 背压点：收得比写得快时，先把队列填满，再让 collector 退避重发
       enqueue_timeout_secs: 5
-      # 写失败让 SDK 重发，不用磁盘缓冲也至少一次；要更低的导出延迟就关掉
-      wait_for_write: true
-      # 等落库的上限，要比 collector 那边 otlp exporter 的 timeout（15s）短
+      # 关掉。入库是我们自己这条链路，没必要让 collector 挂在那儿等一次 ClickHouse 往返：
+      # 收下、进队列就回 OK，单次导出从「攒批 + 写入」的秒级降到毫秒级，一个 consumer
+      # 就能顶掉原来十几个，collector 的 sending_queue 不再堆积。
+      # 代价是丢掉「至少一次」：已经回了 OK、还压在队列/缓冲区里的那部分，Pod 被硬杀
+      # （SIGKILL / OOM / 节点宕）就没了 —— SIGTERM 正常退出会先冲刷完再走，滚动更新
+      # 不丢。要换回「至少一次」就把这里改回 true，其他参数按注释一起回调
+      wait_for_write: false
+      # wait_for_write 关着时这项不生效，留着是为了改回去不用重查
       write_timeout_secs: 8
 
     sink:
@@ -55,11 +62,25 @@ data:
     batch:
       # 一次上报动辄几千个数据点，攒批放大一些
       max_events: 20000
-      timeout_secs: 2
+      # 关掉 wait_for_write 之后这个超时不再算进 collector 的导出延迟，可以放回去攒大批：
+      # 两个副本各 5s 一批，ClickHouse 那边 part 少、后台合并压力小。
+      # 改回 wait_for_write: true 的话这里要压到 1~2s，否则每个导出都要多等一个攒批周期
+      timeout_secs: 5
+
+    retry:
+      # 不等落库了，客户端拿到 OK 就不会再重发 —— 队列是唯一的缓冲，ClickHouse 抖动
+      # 得能多扛一会儿。0.5+1+2+4+8+16+30 ≈ 60s 之后才判死（默认 5 次只有 ~8s，
+      # 一次稍长的 merge 或网络抖动就够把 pipeline 判死重启）
+      max_attempts: 8
+      initial_backoff_ms: 500
+      max_backoff_secs: 30
 
     pipeline:
-      # 队列里最多压 10 万个数据点（约 100 MB），加上正在攒 / 正在写的各 2 万个，
-      # 是这个进程的内存上界，和下面 1Gi 的 limit 对着调
+      # 队列里最多压 10 万个数据点（约 100~150 MB），加上正在攒 / 正在写的各 2 万个，
+      # 是这个进程的内存上界，和下面的 limit 对着调。
+      # 注意：wait_for_write 关了之后 collector 不再被应答节流，这个队列会真的被填到
+      # 接近上限（之前是被应答往返自然限住的）。看 `pipeline 统计` 日志里的
+      # queued_events：长期贴着 10 万说明写入跟不上，那时候是加副本，不是加这个数字
       max_queued_events: 100000
       require_healthy: true
       on_error: stop
@@ -107,8 +128,10 @@ spec:
             periodSeconds: 20
           resources:
             requests:
+              # 队列填满时稳态就在 400~600Mi，128Mi 的 request 是在骗调度器，
+              # 节点吃紧时会被优先驱逐
               cpu: 100m
-              memory: 128Mi
+              memory: 512Mi
             limits:
               cpu: "1"
               memory: 1Gi
